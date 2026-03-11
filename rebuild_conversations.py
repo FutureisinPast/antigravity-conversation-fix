@@ -24,18 +24,47 @@ import base64
 import os
 import sys
 import time
+import platform
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
-DB_PATH = os.path.expandvars(
-    r"%APPDATA%\antigravity\User\globalStorage\state.vscdb"
-)
-CONVERSATIONS_DIR = os.path.expandvars(
-    r"%USERPROFILE%\.gemini\antigravity\conversations"
-)
-BRAIN_DIR = os.path.expandvars(
-    r"%USERPROFILE%\.gemini\antigravity\brain"
-)
+_SYSTEM = platform.system()  # "Windows", "Linux", or "Darwin" (macOS)
+
+if _SYSTEM == "Windows":
+    DB_PATH = os.path.expandvars(
+        r"%APPDATA%\antigravity\User\globalStorage\state.vscdb"
+    )
+    CONVERSATIONS_DIR = os.path.expandvars(
+        r"%USERPROFILE%\.gemini\antigravity\conversations"
+    )
+    BRAIN_DIR = os.path.expandvars(
+        r"%USERPROFILE%\.gemini\antigravity\brain"
+    )
+elif _SYSTEM == "Darwin":  # macOS
+    _home = os.path.expanduser("~")
+    DB_PATH = os.path.join(
+        _home, "Library", "Application Support",
+        "antigravity", "User", "globalStorage", "state.vscdb"
+    )
+    CONVERSATIONS_DIR = os.path.join(
+        _home, ".gemini", "antigravity", "conversations"
+    )
+    BRAIN_DIR = os.path.join(
+        _home, ".gemini", "antigravity", "brain"
+    )
+else:  # Linux and other POSIX systems
+    _home = os.path.expanduser("~")
+    DB_PATH = os.path.join(
+        _home, ".config", "Antigravity",
+        "User", "globalStorage", "state.vscdb"
+    )
+    CONVERSATIONS_DIR = os.path.join(
+        _home, ".gemini", "antigravity", "conversations"
+    )
+    BRAIN_DIR = os.path.join(
+        _home, ".gemini", "antigravity", "brain"
+    )
+
 BACKUP_FILENAME = "trajectorySummaries_backup.txt"
 
 
