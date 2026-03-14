@@ -24,6 +24,7 @@ import base64
 import os
 import sys
 import time
+import subprocess
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
@@ -64,6 +65,47 @@ def decode_varint(data, pos):
     return result, pos
 
 
+def skip_protobuf_field(data, pos, wire_type):
+    """Skip over a protobuf field value at the given position. Returns new_pos."""
+    if wire_type == 0:    # varint
+        _, pos = decode_varint(data, pos)
+    elif wire_type == 2:  # length-delimited
+        length, pos = decode_varint(data, pos)
+        pos += length
+    elif wire_type == 1:  # 64-bit fixed
+        pos += 8
+    elif wire_type == 5:  # 32-bit fixed
+        pos += 4
+    return pos
+
+
+def strip_field_from_protobuf(data, target_field_number):
+    """
+    Remove all instances of a specific field from raw protobuf bytes.
+    Returns the remaining bytes with the target field stripped out.
+    """
+    remaining = b""
+    pos = 0
+    while pos < len(data):
+        start_pos = pos
+        try:
+            tag, pos = decode_varint(data, pos)
+        except Exception:
+            remaining += data[start_pos:]
+            break
+        wire_type = tag & 7
+        field_num = tag >> 3
+        new_pos = skip_protobuf_field(data, pos, wire_type)
+        if new_pos == pos and wire_type not in (0, 1, 2, 5):
+            # Unknown wire type — keep everything from here
+            remaining += data[start_pos:]
+            break
+        pos = new_pos
+        if field_num != target_field_number:
+            remaining += data[start_pos:pos]
+    return remaining
+
+
 # ─── Protobuf Write Helpers ──────────────────────────────────────────────────
 
 def encode_length_delimited(field_number, data):
@@ -77,15 +119,19 @@ def encode_string_field(field_number, string_value):
     return encode_length_delimited(field_number, string_value.encode('utf-8'))
 
 
-# ─── Title Extraction ────────────────────────────────────────────────────────
+# ─── Metadata Extraction ─────────────────────────────────────────────────────
 
-def extract_existing_titles(db_path):
+def extract_existing_metadata(db_path):
     """
-    Read titles already stored in the database's trajectory data.
-    These are preserved so re-running the script doesn't lose app-generated titles.
-    Returns a dict of {conversation_id: title}.
+    Read metadata already stored in the database's trajectory data.
+    Returns two dicts:
+      - titles:      {conversation_id: title}  (real, non-fallback titles)
+      - inner_blobs: {conversation_id: raw_inner_protobuf_bytes}
+    The inner_blobs contain workspace URIs, timestamps, tool state, etc.
+    These are preserved so re-running the script doesn't lose workspace assignments.
     """
     titles = {}
+    inner_blobs = {}
     try:
         conn = sqlite3.connect(db_path)
         cur = conn.cursor()
@@ -97,7 +143,7 @@ def extract_existing_titles(db_path):
         conn.close()
 
         if not row or not row[0]:
-            return titles
+            return titles, inner_blobs
 
         decoded = base64.b64decode(row[0])
         pos = 0
@@ -136,11 +182,15 @@ def extract_existing_titles(db_path):
 
             if uid and info_b64:
                 try:
-                    info_data = base64.b64decode(info_b64)
+                    raw_inner = base64.b64decode(info_b64)
+                    # Save the full inner blob for metadata preservation
+                    inner_blobs[uid] = raw_inner
+
+                    # Also extract the title (field 1 of the inner blob)
                     ip = 0
-                    _, ip = decode_varint(info_data, ip)
-                    il, ip = decode_varint(info_data, ip)
-                    title = info_data[ip:ip + il].decode('utf-8', errors='replace')
+                    _, ip = decode_varint(raw_inner, ip)
+                    il, ip = decode_varint(raw_inner, ip)
+                    title = raw_inner[ip:ip + il].decode('utf-8', errors='replace')
                     # Only keep real titles (skip fallback placeholders)
                     if not title.startswith("Conversation (") and not title.startswith("Conversation "):
                         titles[uid] = title
@@ -150,7 +200,7 @@ def extract_existing_titles(db_path):
     except Exception:
         pass
 
-    return titles
+    return titles, inner_blobs
 
 
 def get_title_from_brain(conversation_id):
@@ -205,15 +255,23 @@ def resolve_title(conversation_id, existing_titles):
 
 # ─── Protobuf Entry Builder ──────────────────────────────────────────────────
 
-def build_trajectory_entry(conversation_id, title):
+def build_trajectory_entry(conversation_id, title, existing_inner_data=None):
     """
     Build a single trajectory summary protobuf entry.
+    If existing_inner_data is provided, the title (field 1) is replaced
+    but ALL other fields (workspace URIs, timestamps, tool state) are preserved.
     Structure:
       field 1 (string) = conversation UUID
       field 2 (sub-message) = { field 1 (string) = base64(inner_info) }
-      inner_info = { field 1 (string) = title }
+      inner_info = { field 1 (string) = title, ... preserved fields ... }
     """
-    inner_info = encode_string_field(1, title)
+    if existing_inner_data:
+        # Strip old title (field 1), prepend the new resolved title
+        preserved_fields = strip_field_from_protobuf(existing_inner_data, 1)
+        inner_info = encode_string_field(1, title) + preserved_fields
+    else:
+        inner_info = encode_string_field(1, title)
+
     info_b64 = base64.b64encode(inner_info).decode('utf-8')
     sub_message = encode_string_field(1, info_b64)
 
@@ -231,6 +289,26 @@ def main():
     print("   Rebuilds your conversation index — sorted by date")
     print("=" * 62)
     print()
+
+    # ── Check if Antigravity is running ───────────────────────────────────
+
+    try:
+        result = subprocess.run(
+            ['tasklist', '/FI', 'IMAGENAME eq antigravity.exe'],
+            capture_output=True, text=True, creationflags=0x08000000
+        )
+        if 'antigravity.exe' in result.stdout.lower():
+            print("  WARNING: Antigravity is still running!")
+            print()
+            print("  The fix will NOT work correctly while Antigravity is open.")
+            print("  Please close it first: File > Exit, or kill from Task Manager.")
+            print()
+            choice = input("  Close Antigravity and press Enter to continue (or type Q to quit): ")
+            if choice.strip().lower() == 'q':
+                return 1
+            print()
+    except Exception:
+        pass  # If tasklist fails, proceed anyway
 
     # ── Validate paths ──────────────────────────────────────────────────────
 
@@ -269,9 +347,11 @@ def main():
 
     # ── Preserve existing titles ────────────────────────────────────────────
 
-    print("  Reading existing titles from database...")
-    existing_titles = extract_existing_titles(DB_PATH)
+    print("  Reading existing metadata from database...")
+    existing_titles, existing_inner_blobs = extract_existing_metadata(DB_PATH)
+    ws_count = sum(1 for v in existing_inner_blobs.values() if len(v) > 100)
     print(f"  Found {len(existing_titles)} existing titles to preserve")
+    print(f"  Found {ws_count} conversations with workspace/metadata to preserve")
     print()
 
     # ── Build the new index ─────────────────────────────────────────────────
@@ -285,11 +365,13 @@ def main():
 
     for i, cid in enumerate(conversation_ids, 1):
         title, source = resolve_title(cid, existing_titles)
-        entry = build_trajectory_entry(cid, title)
+        inner_data = existing_inner_blobs.get(cid)
+        entry = build_trajectory_entry(cid, title, inner_data)
         result += encode_length_delimited(1, entry)
         stats[source] += 1
         marker = markers[source]
-        print(f"    [{i:3d}] {marker} {title[:55]}")
+        ws_flag = " [WS]" if inner_data and len(inner_data) > 100 else ""
+        print(f"    [{i:3d}] {marker} {title[:50]}{ws_flag}")
 
     print("  " + "-" * 58)
     print(f"  Legend: [+] brain artifact  [~] preserved  [?] date fallback")
