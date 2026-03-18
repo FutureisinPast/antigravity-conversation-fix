@@ -22,6 +22,7 @@ License: MIT
 import sqlite3
 import base64
 import os
+import re
 import sys
 import time
 import subprocess
@@ -282,13 +283,269 @@ def resolve_title(conversation_id, existing_titles):
     return f"Conversation {conversation_id[:8]}", "fallback"
 
 
+# ─── Workspace Helpers ───────────────────────────────────────────────────────
+
+def path_to_workspace_uri(folder_path):
+    """
+    Convert a local folder path to a file:/// URI matching Antigravity's format.
+    Example: D:/Repos/antigravity-conversation-fix  →  file:///d%3A/Repos/antigravity-conversation-fix
+    """
+    p = folder_path.replace("\\", "/")
+    # Lowercase drive letter + URL-encode the colon
+    if len(p) >= 2 and p[1] == ":":
+        p = p[0].lower() + "%3A" + p[2:]
+    return "file:///" + p.rstrip("/")
+
+
+def build_workspace_field(folder_path):
+    """
+    Build protobuf field 9 (workspace sub-message) from a filesystem path.
+    Sub-message structure:
+      sub-field 1 (string) = workspace URI
+      sub-field 2 (string) = workspace URI (duplicate)
+      sub-field 3 (string) = "" (corpus)
+      sub-field 4 (string) = "main" (branch)
+    Returns raw bytes for one field-9 entry.
+    """
+    uri = path_to_workspace_uri(folder_path)
+    sub_msg = (
+        encode_string_field(1, uri)
+        + encode_string_field(2, uri)
+        + encode_string_field(3, "")
+        + encode_string_field(4, "main")
+    )
+    return encode_length_delimited(9, sub_msg)
+
+
+def build_timestamp_fields(epoch_seconds):
+    """
+    Build protobuf timestamp fields 3, 7, and 10 from an epoch timestamp.
+    Each is a sub-message with: sub-field 1 (varint) = seconds since epoch.
+    Field 3 = updated_at, Field 7 = created_at, Field 10 = also updated_at.
+    Returns raw protobuf bytes containing all three fields.
+    """
+    seconds = int(epoch_seconds)
+    # Timestamp sub-message: field 1 (varint) = seconds
+    ts_inner = encode_varint((1 << 3) | 0) + encode_varint(seconds)
+    return (
+        encode_length_delimited(3, ts_inner)    # updated_at
+        + encode_length_delimited(7, ts_inner)   # created_at
+        + encode_length_delimited(10, ts_inner)  # also updated_at
+    )
+
+
+def has_timestamp_fields(inner_blob):
+    """
+    Check if the inner blob contains any timestamp fields (3, 7, or 10).
+    Returns True if at least one is found.
+    """
+    if not inner_blob:
+        return False
+    try:
+        pos = 0
+        while pos < len(inner_blob):
+            tag, pos = decode_varint(inner_blob, pos)
+            fn, wt = tag >> 3, tag & 7
+            if fn in (3, 7, 10):
+                return True
+            pos = skip_protobuf_field(inner_blob, pos, wt)
+    except Exception:
+        pass
+    return False
+
+
+def extract_workspace_hint(inner_blob):
+    """
+    Try to extract workspace URI from the protobuf inner blob.
+    Scans length-delimited fields for strings matching file:/// patterns.
+    Returns the workspace path string or None.
+    """
+    if not inner_blob:
+        return None
+    try:
+        pos = 0
+        while pos < len(inner_blob):
+            tag, pos = decode_varint(inner_blob, pos)
+            wire_type = tag & 7
+            field_num = tag >> 3
+            if wire_type == 2:
+                l, pos = decode_varint(inner_blob, pos)
+                content = inner_blob[pos:pos + l]
+                pos += l
+                if field_num > 1:
+                    try:
+                        text = content.decode("utf-8", errors="strict")
+                        if "file:///" in text:
+                            return text
+                    except Exception:
+                        pass
+            elif wire_type == 0:
+                _, pos = decode_varint(inner_blob, pos)
+            elif wire_type == 1:
+                pos += 8
+            elif wire_type == 5:
+                pos += 4
+            else:
+                break
+    except Exception:
+        pass
+    return None
+
+
+def infer_workspace_from_brain(conversation_id):
+    """
+    Scan brain .md files for file:/// paths and infer the workspace
+    from the most common path prefix.
+    Returns a filesystem path string or None.
+    """
+    brain_path = os.path.join(BRAIN_DIR, conversation_id)
+    if not os.path.isdir(brain_path):
+        return None
+
+    path_pattern = re.compile(r"file:///([A-Za-z]:/[^)\s\"']+)")
+    path_counts = {}
+
+    try:
+        for name in os.listdir(brain_path):
+            if not name.endswith(".md") or name.startswith("."):
+                continue
+            filepath = os.path.join(brain_path, name)
+            try:
+                with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read(8192)
+                for match in path_pattern.finditer(content):
+                    path = match.group(1).replace("\\", "/")
+                    parts = path.split("/")
+                    if len(parts) >= 4:
+                        ws = "/".join(parts[:4])  # e.g. D:/Repos/antigravity-conversation-fix
+                        path_counts[ws] = path_counts.get(ws, 0) + 1
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+    if not path_counts:
+        return None
+
+    best = max(path_counts, key=path_counts.get)
+    # Convert back from URL-decoded path to filesystem path
+    return best.replace("/", os.sep)
+
+
+def _prompt_valid_folder(prompt_text):
+    """
+    Keep asking for a folder path until user gives a valid one or presses Enter.
+    Returns valid folder path string, or None if user skips (empty input).
+    """
+    while True:
+        raw = input(prompt_text).strip()
+        if raw == "":
+            return None
+        folder = raw.strip('"').strip("'").rstrip("\\/")
+        if os.path.isdir(folder):
+            print(f"    ✓ Mapped to {folder}")
+            return folder
+        else:
+            print(f"    ✗ Path not found: {folder}")
+            print(f"      (make sure the folder exists — try again or press Enter to skip)")
+
+
+def prompt_workspace_path(label):
+    """
+    Prompt user for a workspace folder path with validation.
+    Returns (path, mode) where mode is:
+      - 'assigned': user entered a valid path
+      - 'all':      user typed 'all', then provided a valid path
+      - 'skip':     user pressed Enter
+      - 'quit':     user typed 'q'
+    """
+    print(f"  {label}")
+    while True:
+        raw = input("    Workspace path (Enter=skip, 'all'=batch, 'q'=stop): ").strip()
+        if raw == "":
+            return None, "skip"
+        if raw.lower() == "q":
+            return None, "quit"
+        if raw.lower() == "all":
+            folder = _prompt_valid_folder("    Path for ALL remaining (Enter=cancel batch): ")
+            if folder is None:
+                continue  # cancelled batch, loop back to main prompt
+            return folder, "all"
+        # Normal path entry
+        folder = raw.strip('"').strip("'").rstrip("\\/")
+        if os.path.isdir(folder):
+            print(f"    ✓ Mapped to {folder}")
+            return folder, "assigned"
+        else:
+            print(f"    ✗ Path not found: {folder}")
+            print(f"      (make sure the folder exists — try again or press Enter to skip)")
+
+
+def interactive_workspace_assignment(unmapped_entries):
+    """
+    Show unmapped conversations and let user assign workspace paths.
+    unmapped_entries: list of (index, conversation_id, title)
+    Returns dict: {conversation_id: folder_path}
+    """
+    if not unmapped_entries:
+        return {}
+
+    print()
+    print("  " + "=" * 58)
+    print("  WORKSPACE ASSIGNMENT")
+    print("  " + "=" * 58)
+    print(f"  {len(unmapped_entries)} conversation(s) have no workspace mapping.")
+    print("  You can assign each to a workspace folder.")
+    print()
+    for idx, cid, title in unmapped_entries:
+        print(f"    [{idx:3d}] {title[:55]}")
+    print()
+
+    assignments = {}
+    batch_path = None
+
+    for idx, cid, title in unmapped_entries:
+        if batch_path:
+            # batch mode — apply same path to all remaining
+            assignments[cid] = batch_path
+            print(f"    [{idx:3d}] {title[:45]}  → {os.path.basename(batch_path)}")
+            continue
+
+        label = f"[{idx:3d}] {title[:55]}"
+        folder, mode = prompt_workspace_path(label)
+
+        if mode == "quit":
+            print("    Stopped — remaining conversations left unmapped.")
+            break
+        elif mode == "skip":
+            print("    Skipped.")
+            continue
+        elif mode == "all":
+            batch_path = folder
+            assignments[cid] = folder
+        elif mode == "assigned":
+            assignments[cid] = folder
+
+    assigned_count = len(assignments)
+    if assigned_count:
+        print()
+        print(f"  ✓ Assigned workspace to {assigned_count} conversation(s)")
+    print()
+    return assignments
+
+
 # ─── Protobuf Entry Builder ──────────────────────────────────────────────────
 
-def build_trajectory_entry(conversation_id, title, existing_inner_data=None):
+def build_trajectory_entry(conversation_id, title, existing_inner_data=None,
+                           workspace_path=None, pb_mtime=None):
     """
     Build a single trajectory summary protobuf entry.
     If existing_inner_data is provided, the title (field 1) is replaced
     but ALL other fields (workspace URIs, timestamps, tool state) are preserved.
+    If workspace_path is provided and there is no existing_inner_data,
+    a workspace field (field 9) is injected.
+    If pb_mtime is provided and timestamps are missing, timestamp fields
+    (3, 7, 10) are injected so Antigravity sorts correctly.
     Structure:
       field 1 (string) = conversation UUID
       field 2 (sub-message) = { field 1 (string) = base64(inner_info) }
@@ -298,8 +555,18 @@ def build_trajectory_entry(conversation_id, title, existing_inner_data=None):
         # Strip old title (field 1), prepend the new resolved title
         preserved_fields = strip_field_from_protobuf(existing_inner_data, 1)
         inner_info = encode_string_field(1, title) + preserved_fields
+        # Inject workspace only if blob has no existing workspace and user assigned one
+        if workspace_path and not extract_workspace_hint(existing_inner_data):
+            inner_info += build_workspace_field(workspace_path)
+        # Inject timestamps if missing
+        if pb_mtime and not has_timestamp_fields(existing_inner_data):
+            inner_info += build_timestamp_fields(pb_mtime)
     else:
         inner_info = encode_string_field(1, title)
+        if workspace_path:
+            inner_info += build_workspace_field(workspace_path)
+        if pb_mtime:
+            inner_info += build_timestamp_fields(pb_mtime)
 
     info_b64 = base64.b64encode(inner_info).decode('utf-8')
     sub_message = encode_string_field(1, info_b64)
@@ -383,28 +650,58 @@ def main():
     print(f"  Found {ws_count} conversations with workspace/metadata to preserve")
     print()
 
-    # ── Build the new index ─────────────────────────────────────────────────
+    # ── Scan conversations & detect unmapped ─────────────────────────────────
 
-    print("  Building conversation index (newest first):")
+    print("  Scanning conversations (newest first):")
     print("  " + "-" * 58)
 
-    result = b""
+    resolved = []  # list of (cid, title, source, inner_data, has_workspace)
     stats = {"brain": 0, "preserved": 0, "fallback": 0}
     markers = {"brain": "+", "preserved": "~", "fallback": "?"}
 
     for i, cid in enumerate(conversation_ids, 1):
         title, source = resolve_title(cid, existing_titles)
         inner_data = existing_inner_blobs.get(cid)
-        entry = build_trajectory_entry(cid, title, inner_data)
-        result += encode_length_delimited(1, entry)
+        has_ws = bool(inner_data and extract_workspace_hint(inner_data))
+        resolved.append((cid, title, source, inner_data, has_ws))
         stats[source] += 1
         marker = markers[source]
-        ws_flag = " [WS]" if inner_data and len(inner_data) > 100 else ""
+        ws_flag = " [WS]" if has_ws else ""
         print(f"    [{i:3d}] {marker} {title[:50]}{ws_flag}")
 
     print("  " + "-" * 58)
     print(f"  Legend: [+] brain artifact  [~] preserved  [?] date fallback")
     print(f"  Totals: {stats['brain']} from brain, {stats['preserved']} preserved, {stats['fallback']} fallback")
+    print()
+
+    # ── Interactive workspace assignment ────────────────────────────────────
+
+    unmapped = [(i, cid, title)
+                for i, (cid, title, _, inner_data, has_ws) in enumerate(resolved, 1)
+                if not has_ws]
+
+    ws_assignments = {}  # cid → folder_path
+    if unmapped:
+        ws_assignments = interactive_workspace_assignment(unmapped)
+
+    # ── Build the new index ─────────────────────────────────────────────────
+
+    print("  Building final index...")
+    result = b""
+    ws_assigned_count = 0
+
+    for cid, title, source, inner_data, has_ws in resolved:
+        ws_path = ws_assignments.get(cid)
+        # Get .pb mtime for timestamp injection
+        pb_path = os.path.join(CONVERSATIONS_DIR, f"{cid}.pb")
+        pb_mtime = os.path.getmtime(pb_path) if os.path.exists(pb_path) else None
+        entry = build_trajectory_entry(cid, title, inner_data, ws_path, pb_mtime)
+        result += encode_length_delimited(1, entry)
+        if ws_path:
+            ws_assigned_count += 1
+
+    if ws_assigned_count:
+        print(f"  Workspace assigned to {ws_assigned_count} conversation(s)")
     print()
 
     # ── Backup current data ─────────────────────────────────────────────────
