@@ -4,11 +4,14 @@ Your Antigravity conversation history disappeared? Conversations showing in the 
 
 ## ⚡ Quick Start (Windows)
 
-1. Download **`Antigravity_Conversation_Fix.exe`** from the [Releases](../../releases) page
-2. Double-click it — a terminal window will open
-3. If Antigravity is still running, the tool will warn you and ask you to close it first
+1. **Close Antigravity** completely (File → Exit or kill from Task Manager)
+2. Download **`Antigravity_Conversation_Fix.exe`** from the [Releases](../../releases) page
+3. Double-click it — a terminal window will open
 4. The tool scans your conversations, rebuilds the index, and shows you the results
-5. Restart your PC, then open Antigravity — your conversations are back, sorted by date
+5. When prompted for workspace assignment, choose an option:
+   - **Press Enter or 1** — auto-assigns workspaces from your brain files *(recommended)*
+   - **Press 2** — auto-assigns first, then lets you manually assign any remaining conversations
+6. Restart your PC, then open Antigravity — your conversations are back, sorted by date
 
 > **No Python or developer tools required.** Just download, run, done.
 
@@ -57,7 +60,7 @@ When the index gets corrupted, conversations still exist on disk but don't show 
 
 ### v1.03
 - **New:** **Workspace auto-recovery** — scans your brain artifact `.md` files for project paths and automatically re-assigns lost workspace mappings. If you ran v1.0 and lost your workspace assignments, this version can recover most of them automatically.
-- **New:** **Interactive workspace assignment** — for conversations that can't be auto-detected, the script prompts you to assign a workspace folder. Supports batch assignment (`all`) for quick setup.
+- **New:** **Workspace assignment menu** — choose between auto-assigning only (Option 1) or auto-assigning plus manual interactive prompts for any remaining unmapped conversations (Option 2). Supports batch assignment (`all`) for quick setup.
 - **New:** **Timestamp injection** — injects proper timestamps (created/updated) into conversations that are missing them, ensuring Antigravity sorts everything correctly by date.
 - **Fix:** Workspace URIs now properly URL-encode spaces and special characters (e.g. `My Project` → `My%20Project`).
 - **Fix:** Cross-platform process detection — Linux/macOS now properly checks if Antigravity is running.
@@ -101,7 +104,7 @@ A: Those conversations don't have brain artifacts, and their original titles wer
 A: The tool will detect if Antigravity is running and warn you. It's recommended to close it first so the app doesn't overwrite your fix when it exits.
 
 **Q: I ran v1.0 and my workspace chats were removed. Can I get them back?**
-A: Yes! v1.03 can auto-recover most workspace assignments by scanning your brain artifact files. Just run the latest version and it will detect and restore workspace mappings automatically. For any it can't detect, you'll be prompted to assign them manually.
+A: Yes! v1.03 can auto-recover most workspace assignments by scanning your brain artifact files. When prompted, press Enter or 1 for auto-assignment. If some conversations can't be auto-detected, choose option 2 to manually assign them, or just assign them later inside Antigravity by dragging them into the correct workspace.
 
 ## License
 
