@@ -157,9 +157,13 @@ def encode_string_field(field_number, string_value):
 def path_to_workspace_uri(folder_path):
     """
     Convert a local folder path to a file:/// URI matching Antigravity's format.
+    Also pass through explicit URIs for WSL/SSH (vscode-remote://) or file:///.
     Handles spaces and special characters via URL-encoding.
     Example: D:\\Repos\\My Project  →  file:///d%3A/Repos/My%20Project
     """
+    if folder_path.startswith("vscode-remote://") or folder_path.startswith("file:///"):
+        return folder_path
+
     p = folder_path.replace("\\", "/")
     # Lowercase drive letter + URL-encode the colon
     if len(p) >= 2 and p[1] == ":":
@@ -217,7 +221,7 @@ def extract_workspace_hint(inner_blob):
                 if field_num > 1:
                     try:
                         text = content.decode("utf-8", errors="strict")
-                        if "file:///" in text:
+                        if "file:///" in text or "vscode-remote://" in text:
                             return text
                     except Exception:
                         pass
@@ -245,9 +249,9 @@ def infer_workspace_from_brain(conversation_id):
         return None
 
     if _SYSTEM == "Windows":
-        path_pattern = re.compile(r"file:///([A-Za-z](?:%3A|:)/[^)\s\"'\]>]+)")
+        path_pattern = re.compile(r"(?:file:///|vscode-remote://)([A-Za-z](?:%3A|:)/[^)\s\"'\]>]+|[^)\s\"'\]>]+)")
     else:
-        path_pattern = re.compile(r"file:///([^)\s\"'\]>]+)")
+        path_pattern = re.compile(r"(?:file:///|vscode-remote://)([^)\s\"'\]>]+)")
 
     path_counts = {}
 
@@ -332,6 +336,9 @@ def _prompt_valid_folder(prompt_text):
         if raw == "":
             return None
         folder = raw.strip('"').strip("'").rstrip("\\/")
+        if folder.startswith("vscode-remote://") or folder.startswith("file:///"):
+            print(f"    + Mapped remote URI: {folder}")
+            return folder
         if os.path.isdir(folder):
             print(f"    + Mapped to {folder}")
             return folder
@@ -385,6 +392,10 @@ def interactive_workspace_assignment(unmapped_entries):
                 break
             # Normal path entry
             folder = raw.strip('"').strip("'").rstrip("\\/")
+            if folder.startswith("vscode-remote://") or folder.startswith("file:///"):
+                print(f"    + Mapped to {folder}")
+                assignments[cid] = folder
+                break
             if os.path.isdir(folder):
                 print(f"    + Mapped to {folder}")
                 assignments[cid] = folder
