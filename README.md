@@ -13,7 +13,16 @@ Your Antigravity conversation history disappeared? Conversations showing in the 
    - **Press 2** — auto-assigns first, then lets you manually assign any remaining conversations
 6. Restart your PC, then open Antigravity — your conversations are back, sorted by date
 
-> **No Python or developer tools required.** Just download, run, done.
+### Advanced: Auto-Sync Background Daemon (Linux only)
+
+Tired of having to run the script manually? v1.05 includes an **Auto-Sync Daemon** (`antigravity_watcher.py`) perfectly suited for Linux environments.
+Once setup, it starts automatically on login, watches for new conversations hidden off by Antigravity, and seamlessly runs a non-interactive synchronization (`--auto`) whenever the Antigravity app is closed.
+
+1. Create a Systemd user service:
+   `~/.config/systemd/user/antigravity-sync.service`
+2. Enable and start: `systemctl --user enable --now antigravity-sync.service`
+
+> **No Python or developer tools required (for the main exe).** Just download, run, done.
 
 ## What It Fixes
 
@@ -58,6 +67,12 @@ When the index gets corrupted, conversations still exist on disk but don't show 
 | `[WS]` | Workspace metadata preserved or recovered |
 
 ## Changelog
+
+### v1.05
+- **New:** **Automated Background Sync** — Added `antigravity_watcher.py` to optionally run as a background service (e.g. systemd). It watches the directories for changes and automatically rebuilds the index (`--auto`) when Antigravity is closed.
+- **New:** **Deep Scanning** — Added support for scanning implicit (background task) and backup folders, often doubling the amount of conversations successfully recovered.
+- **Fix:** Used exact binary matching (`pgrep -x`) on Linux/macOS to avoid false positive matches where the script would detect itself as "running" and abort.
+- **Fix:** Guarded `input()` pauses with process-safe checks to allow truly non-interactive automated executions.
 
 ### v1.04
 - **New:** **Remote workspace support** — now correctly handles `vscode-remote://` URIs for WSL, SSH, and Docker workspaces. Remote paths are detected during auto-assignment and accepted during manual assignment without local filesystem validation.

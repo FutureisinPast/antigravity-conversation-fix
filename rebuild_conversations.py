@@ -1,5 +1,5 @@
 """
-Antigravity Conversation Fix  (v1.04)
+Antigravity Conversation Fix  (v1.05)
 =============================
 Rebuilds the Antigravity conversation index so all your chat history
 appears correctly — sorted by date (newest first) with proper titles.
@@ -63,9 +63,13 @@ else:  # Linux and other POSIX systems
         _home, ".config", "Antigravity",
         "User", "globalStorage", "state.vscdb"
     )
-    CONVERSATIONS_DIR = os.path.join(
-        _home, ".gemini", "antigravity", "conversations"
-    )
+    # Primary locations to scan for .pb files
+    SEARCH_DIRS = [
+        os.path.join(_home, ".gemini", "antigravity", "conversations"),
+        os.path.join(_home, ".gemini", "antigravity", "implicit"),
+        os.path.join(_home, ".gemini", "antigravity_backup", "conversations"),
+        os.path.join(_home, ".gemini", "antigravity_backup", "implicit"),
+    ]
     BRAIN_DIR = os.path.join(
         _home, ".gemini", "antigravity", "brain"
     )
@@ -535,7 +539,7 @@ def get_title_from_brain(conversation_id):
     return None
 
 
-def resolve_title(conversation_id, existing_titles):
+def resolve_title(conversation_id, existing_titles, file_path=None):
     """
     Determine the best title for a conversation. Priority:
       1. Brain artifact .md heading
@@ -550,9 +554,8 @@ def resolve_title(conversation_id, existing_titles):
     if conversation_id in existing_titles:
         return existing_titles[conversation_id], "preserved"
 
-    conv_file = os.path.join(CONVERSATIONS_DIR, f"{conversation_id}.pb")
-    if os.path.exists(conv_file):
-        mod_time = time.strftime("%b %d", time.localtime(os.path.getmtime(conv_file)))
+    if file_path and os.path.exists(file_path):
+        mod_time = time.strftime("%b %d", time.localtime(os.path.getmtime(file_path)))
         return f"Conversation ({mod_time}) {conversation_id[:8]}", "fallback"
 
     return f"Conversation {conversation_id[:8]}", "fallback"
@@ -601,14 +604,16 @@ def build_trajectory_entry(conversation_id, title, existing_inner_data=None,
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
+    is_auto = "--auto" in sys.argv
+
     print()
     print("=" * 62)
-    print("   Antigravity Conversation Fix  v1.04")
+    print("   Antigravity Conversation Fix  v1.05")
     print("   Rebuilds your conversation index — sorted by date")
     print("=" * 62)
     print()
 
-    # ── Check if Antigravity is running (Windows only) ────────────────────
+    # ── Check if Antigravity is running ───────────────────────────────────
 
     if _SYSTEM == "Windows":
         try:
@@ -619,6 +624,9 @@ def main():
             if 'antigravity.exe' in result.stdout.lower():
                 print("  WARNING: Antigravity is still running!")
                 print()
+                if is_auto:
+                    print("  Auto-mode: Aborting to prevent database corruption.")
+                    return 1
                 print("  The fix will NOT work correctly while Antigravity is open.")
                 print("  Please close it first: File > Exit, or kill from Task Manager.")
                 print()
@@ -632,11 +640,14 @@ def main():
         # Linux / macOS: check for antigravity process
         try:
             result = subprocess.run(
-                ['pgrep', '-f', 'antigravity'],
+                ['pgrep', '-x', 'antigravity'],
                 capture_output=True, text=True
             )
             if result.stdout.strip():
                 print("  WARNING: Antigravity may still be running!")
+                if is_auto:
+                    print("  Auto-mode: Aborting to prevent database corruption.")
+                    return 1
                 print("  Please close it before proceeding.")
                 print()
                 choice = input("  Press Enter to continue anyway (or type Q to quit): ")
@@ -653,31 +664,42 @@ def main():
         print(f"    {DB_PATH}")
         print()
         print("  Make sure Antigravity has been installed and opened at least once.")
-        input("\n  Press Enter to close...")
-        return 1
-
-    if not os.path.isdir(CONVERSATIONS_DIR):
-        print(f"  ERROR: Conversations directory not found at:")
-        print(f"    {CONVERSATIONS_DIR}")
-        input("\n  Press Enter to close...")
+        if not is_auto:
+            input("\n  Press Enter to close...")
         return 1
 
     # ── Discover conversations ──────────────────────────────────────────────
 
-    conv_files = [f for f in os.listdir(CONVERSATIONS_DIR) if f.endswith('.pb')]
+    # Use a dict {cid: latest_file_path} to handle duplicates across folders
+    discovered = {}  # cid -> (mtime, path)
 
-    if not conv_files:
+    available_dirs = [d for d in SEARCH_DIRS if os.path.isdir(d)]
+    if not available_dirs:
+        print(f"  ERROR: No conversation directories found.")
+        print(f"  Checked: {SEARCH_DIRS}")
+        if not is_auto:
+            input("\n  Press Enter to close...")
+        return 1
+
+    for d in available_dirs:
+        for f in os.listdir(d):
+            if f.endswith('.pb'):
+                cid = f[:-3]
+                fpath = os.path.join(d, f)
+                mtime = os.path.getmtime(fpath)
+                if cid not in discovered or mtime > discovered[cid][0]:
+                    discovered[cid] = (mtime, fpath)
+
+    if not discovered:
         print("  No conversations found on disk. Nothing to fix.")
-        input("\n  Press Enter to close...")
+        if not is_auto:
+            input("\n  Press Enter to close...")
         return 0
 
-    conv_files.sort(
-        key=lambda f: os.path.getmtime(os.path.join(CONVERSATIONS_DIR, f)),
-        reverse=True
-    )
-    conversation_ids = [f[:-3] for f in conv_files]
+    # Sort by mtime descending
+    sorted_ids = sorted(discovered.keys(), key=lambda k: discovered[k][0], reverse=True)
 
-    print(f"  Found {len(conversation_ids)} conversations on disk")
+    print(f"  Found {len(sorted_ids)} unique conversations across {len(available_dirs)} folders")
     print()
 
     # ── Preserve existing metadata ──────────────────────────────────────────
@@ -695,15 +717,16 @@ def main():
     print("  Scanning conversations (newest first):")
     print("  " + "-" * 58)
 
-    resolved = []  # (cid, title, source, inner_data, has_ws)
+    resolved = []  # (cid, title, source, inner_data, has_ws, file_path)
     stats = {"brain": 0, "preserved": 0, "fallback": 0}
     markers = {"brain": "+", "preserved": "~", "fallback": "?"}
 
-    for i, cid in enumerate(conversation_ids, 1):
-        title, source = resolve_title(cid, existing_titles)
+    for i, cid in enumerate(sorted_ids, 1):
+        mtime, fpath = discovered[cid]
+        title, source = resolve_title(cid, existing_titles, fpath)
         inner_data = existing_inner_blobs.get(cid)
         has_ws = bool(inner_data and extract_workspace_hint(inner_data))
-        resolved.append((cid, title, source, inner_data, has_ws))
+        resolved.append((cid, title, source, inner_data, has_ws, fpath))
         stats[source] += 1
         marker = markers[source]
         ws_flag = " [WS]" if has_ws else ""
@@ -717,7 +740,7 @@ def main():
     # ── Workspace assignment ───────────────────────────────────────────────
 
     unmapped = [(i, cid, title)
-                for i, (cid, title, _, inner_data, has_ws) in enumerate(resolved, 1)
+                for i, (cid, title, _, inner_data, has_ws, _) in enumerate(resolved, 1)
                 if not has_ws]
 
     ws_assignments = {}  # cid -> folder_path
@@ -728,7 +751,10 @@ def main():
         print("  Press Enter or 1: Auto-assign workspaces (recommended)")
         print("  Press 2:          Auto-assign + manually assign the rest")
         print()
-        choice = input("  Your choice: ").strip()
+        if is_auto:
+            choice = '1'
+        else:
+            choice = input("  Your choice: ").strip()
 
         # Auto-infer from brain artifacts (both options do this)
         if os.path.isdir(BRAIN_DIR):
@@ -766,10 +792,9 @@ def main():
     ws_total = 0
     ts_injected = 0
 
-    for cid, title, source, inner_data, has_ws in resolved:
+    for cid, title, source, inner_data, has_ws, fpath in resolved:
         ws_path = ws_assignments.get(cid)
-        pb_path = os.path.join(CONVERSATIONS_DIR, f"{cid}.pb")
-        pb_mtime = os.path.getmtime(pb_path) if os.path.exists(pb_path) else None
+        pb_mtime = os.path.getmtime(fpath) if os.path.exists(fpath) else None
 
         entry = build_trajectory_entry(cid, title, inner_data, ws_path, pb_mtime)
         result_bytes += encode_length_delimited(1, entry)
@@ -821,7 +846,7 @@ def main():
 
     # ── Done ────────────────────────────────────────────────────────────────
 
-    total = len(conversation_ids)
+    total = len(sorted_ids)
     print()
     print("  " + "=" * 58)
     print(f"  SUCCESS! Rebuilt index with {total} conversations.")
@@ -832,7 +857,8 @@ def main():
     print("    2. REBOOT your PC (full restart, not just app restart)")
     print("    3. Open Antigravity — conversations should appear sorted by date")
     print()
-    input("  Press Enter to close...")
+    if not is_auto:
+        input("  Press Enter to close...")
     return 0
 
 
