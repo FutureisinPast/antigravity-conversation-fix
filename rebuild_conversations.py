@@ -1,23 +1,20 @@
 """
-Antigravity Conversation Fix  (v1.04)
+Antigravity Conversation Fix  (v1.08 - Complete Remote SSH Support)
 =============================
 Rebuilds the Antigravity conversation index so all your chat history
 appears correctly — sorted by date (newest first) with proper titles.
 
-Fixes:
-  - Missing conversations in the sidebar
-  - Wrong ordering (not sorted by date)
-  - Missing/placeholder titles
-  - Workspace assignments stripped or lost
-  - Missing timestamps causing sort issues
+New in v1.08:
+  - Fixed "key cannot be used for signing" SSH error by enforcing strict password auth.
+  - Added prompt for custom Remote Home Path (e.g. /home1/user) for non-standard server setups.
 
 Usage:
   1. CLOSE Antigravity completely (File > Exit, or kill from Task Manager)
-  2. Run this script (or use run.bat)
-  3. REBOOT your PC (full restart, not just app restart)
-  4. Open Antigravity — your conversations should appear, sorted by date
+  2. Install paramiko if you haven't: pip install paramiko
+  3. Run this script locally: python rebuild_conversations.py
+  4. REBOOT your PC (full restart, not just app restart)
 
-Requirements: Python 3.7+ (no external packages needed)
+Requirements: Python 3.7+, paramiko (for Remote SSH)
 License: MIT
 """
 
@@ -29,9 +26,13 @@ import sys
 import time
 import subprocess
 import platform
+import shutil
+import tempfile
+import getpass
+import stat
 from urllib.parse import quote
 
-# ─── Paths ────────────────────────────────────────────────────────────────────
+# ─── Default Paths ────────────────────────────────────────────────────────────
 
 _SYSTEM = platform.system()
 
@@ -39,10 +40,10 @@ if _SYSTEM == "Windows":
     DB_PATH = os.path.expandvars(
         r"%APPDATA%\antigravity\User\globalStorage\state.vscdb"
     )
-    CONVERSATIONS_DIR = os.path.expandvars(
+    LOCAL_CONV_DIR = os.path.expandvars(
         r"%USERPROFILE%\.gemini\antigravity\conversations"
     )
-    BRAIN_DIR = os.path.expandvars(
+    LOCAL_BRAIN_DIR = os.path.expandvars(
         r"%USERPROFILE%\.gemini\antigravity\brain"
     )
 elif _SYSTEM == "Darwin":  # macOS
@@ -51,10 +52,10 @@ elif _SYSTEM == "Darwin":  # macOS
         _home, "Library", "Application Support",
         "antigravity", "User", "globalStorage", "state.vscdb"
     )
-    CONVERSATIONS_DIR = os.path.join(
+    LOCAL_CONV_DIR = os.path.join(
         _home, ".gemini", "antigravity", "conversations"
     )
-    BRAIN_DIR = os.path.join(
+    LOCAL_BRAIN_DIR = os.path.join(
         _home, ".gemini", "antigravity", "brain"
     )
 else:  # Linux and other POSIX systems
@@ -63,10 +64,10 @@ else:  # Linux and other POSIX systems
         _home, ".config", "Antigravity",
         "User", "globalStorage", "state.vscdb"
     )
-    CONVERSATIONS_DIR = os.path.join(
+    LOCAL_CONV_DIR = os.path.join(
         _home, ".gemini", "antigravity", "conversations"
     )
-    BRAIN_DIR = os.path.join(
+    LOCAL_BRAIN_DIR = os.path.join(
         _home, ".gemini", "antigravity", "brain"
     )
 
@@ -76,7 +77,6 @@ BACKUP_FILENAME = "trajectorySummaries_backup.txt"
 # ─── Protobuf Varint Helpers ─────────────────────────────────────────────────
 
 def encode_varint(value):
-    """Encode an integer as a protobuf varint."""
     result = b""
     while value > 0x7F:
         result += bytes([(value & 0x7F) | 0x80])
@@ -84,9 +84,7 @@ def encode_varint(value):
     result += bytes([value & 0x7F])
     return result or b'\x00'
 
-
 def decode_varint(data, pos):
-    """Decode a protobuf varint at the given position. Returns (value, new_pos)."""
     result, shift = 0, 0
     while pos < len(data):
         b = data[pos]
@@ -97,26 +95,19 @@ def decode_varint(data, pos):
         pos += 1
     return result, pos
 
-
 def skip_protobuf_field(data, pos, wire_type):
-    """Skip over a protobuf field value at the given position. Returns new_pos."""
-    if wire_type == 0:    # varint
+    if wire_type == 0:
         _, pos = decode_varint(data, pos)
-    elif wire_type == 2:  # length-delimited
+    elif wire_type == 2:
         length, pos = decode_varint(data, pos)
         pos += length
-    elif wire_type == 1:  # 64-bit fixed
+    elif wire_type == 1:
         pos += 8
-    elif wire_type == 5:  # 32-bit fixed
+    elif wire_type == 5:
         pos += 4
     return pos
 
-
 def strip_field_from_protobuf(data, target_field_number):
-    """
-    Remove all instances of a specific field from raw protobuf bytes.
-    Returns the remaining bytes with the target field stripped out.
-    """
     remaining = b""
     pos = 0
     while pos < len(data):
@@ -130,7 +121,6 @@ def strip_field_from_protobuf(data, target_field_number):
         field_num = tag >> 3
         new_pos = skip_protobuf_field(data, pos, wire_type)
         if new_pos == pos and wire_type not in (0, 1, 2, 5):
-            # Unknown wire type — keep everything from here
             remaining += data[start_pos:]
             break
         pos = new_pos
@@ -142,36 +132,23 @@ def strip_field_from_protobuf(data, target_field_number):
 # ─── Protobuf Write Helpers ──────────────────────────────────────────────────
 
 def encode_length_delimited(field_number, data):
-    """Encode a length-delimited protobuf field (wire type 2)."""
     tag = (field_number << 3) | 2
     return encode_varint(tag) + encode_varint(len(data)) + data
 
-
 def encode_string_field(field_number, string_value):
-    """Encode a string as a protobuf field."""
     return encode_length_delimited(field_number, string_value.encode('utf-8'))
 
 
 # ─── Workspace Helpers ───────────────────────────────────────────────────────
 
 def _is_remote_uri(path_or_uri):
-    """Check if a string is already a remote/absolute URI (not a local path)."""
     return path_or_uri.startswith("vscode-remote://") or path_or_uri.startswith("file:///")
 
-
 def path_to_workspace_uri(folder_path):
-    """
-    Convert a local folder path to a file:/// URI matching Antigravity's format.
-    Passes through remote URIs (vscode-remote://, file:///) unchanged.
-    Handles spaces and special characters via URL-encoding.
-    Example: D:\\Repos\\My Project  →  file:///d%3A/Repos/My%20Project
-    """
-    # Pass through URIs that are already in the correct format
     if _is_remote_uri(folder_path):
         return folder_path
 
     p = folder_path.replace("\\", "/")
-    # Lowercase drive letter + URL-encode the colon
     if len(p) >= 2 and p[1] == ":":
         drive = p[0].lower()
         rest = p[2:]
@@ -179,7 +156,6 @@ def path_to_workspace_uri(folder_path):
         drive = None
         rest = p
 
-    # URL-encode each path segment (preserving slashes)
     segments = rest.split("/")
     encoded_segments = [quote(seg, safe="") for seg in segments]
     encoded_path = "/".join(encoded_segments)
@@ -189,29 +165,12 @@ def path_to_workspace_uri(folder_path):
     else:
         return f"file:///{encoded_path.lstrip('/')}"
 
-
 def build_workspace_field(folder_path):
-    """
-    Build protobuf field 9 (workspace sub-message) from a filesystem path.
-    Sub-message structure:
-      sub-field 1 (string) = workspace URI
-      sub-field 2 (string) = workspace URI (duplicate)
-    Returns raw bytes for one field-9 entry.
-    """
     uri = path_to_workspace_uri(folder_path)
-    sub_msg = (
-        encode_string_field(1, uri)
-        + encode_string_field(2, uri)
-    )
+    sub_msg = encode_string_field(1, uri) + encode_string_field(2, uri)
     return encode_length_delimited(9, sub_msg)
 
-
 def extract_workspace_hint(inner_blob):
-    """
-    Try to extract a workspace URI from the protobuf inner blob.
-    Scans length-delimited fields for strings matching file:/// or
-    vscode-remote:// patterns. Returns the URI string if found, or None.
-    """
     if not inner_blob:
         return None
     try:
@@ -243,18 +202,11 @@ def extract_workspace_hint(inner_blob):
         pass
     return None
 
-
-def infer_workspace_from_brain(conversation_id):
-    """
-    Scan brain .md files for file:/// and vscode-remote:// paths and infer
-    the workspace from the most common project folder prefix.
-    Returns a filesystem path string, a remote URI string, or None.
-    """
-    brain_path = os.path.join(BRAIN_DIR, conversation_id)
+def infer_workspace_from_brain(conversation_id, brain_dir_base):
+    brain_path = os.path.join(brain_dir_base, conversation_id)
     if not os.path.isdir(brain_path):
         return None
 
-    # Two separate patterns: local file:/// and remote vscode-remote://
     if _SYSTEM == "Windows":
         local_pattern = re.compile(r"file:///([A-Za-z](?:%3A|:)/[^)\s\"'\]>]+)")
     else:
@@ -262,7 +214,6 @@ def infer_workspace_from_brain(conversation_id):
     remote_pattern = re.compile(r"(vscode-remote://[^)\s\"'\]>]+)")
 
     path_counts = {}
-
     try:
         for name in os.listdir(brain_path):
             if not name.endswith(".md") or name.startswith("."):
@@ -272,25 +223,15 @@ def infer_workspace_from_brain(conversation_id):
                 with open(filepath, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read(16384)
 
-                # Check for remote URIs first (return full URI, not path)
                 for match in remote_pattern.finditer(content):
                     uri = match.group(1)
                     path_counts[uri] = path_counts.get(uri, 0) + 1
 
-                # Check for local file:/// paths
                 for match in local_pattern.finditer(content):
                     raw = match.group(1)
-                    # Normalize: decode %3A back to colon, decode %20 to space
-                    raw = raw.replace("%3A", ":").replace("%3a", ":")
-                    raw = raw.replace("%20", " ")
+                    raw = raw.replace("%3A", ":").replace("%3a", ":").replace("%20", " ")
                     parts = raw.replace("\\", "/").split("/")
-                    # On Windows paths like C:/Users/name/Desktop/Project,
-                    # we need 5 segments to reach the actual project folder.
-                    # On Linux/Mac like /home/name/projects/Project, 4 is enough.
-                    if _SYSTEM == "Windows":
-                        depth = 5
-                    else:
-                        depth = 4
+                    depth = 5 if _SYSTEM == "Windows" else 4
                     if len(parts) >= depth:
                         ws = "/".join(parts[:depth])
                         path_counts[ws] = path_counts.get(ws, 0) + 1
@@ -303,7 +244,6 @@ def infer_workspace_from_brain(conversation_id):
         return None
 
     best = max(path_counts, key=path_counts.get)
-    # Remote URIs are returned as-is; local paths get OS-native separators
     if best.startswith("vscode-remote://"):
         return best
     return best.replace("/", os.sep)
@@ -312,11 +252,6 @@ def infer_workspace_from_brain(conversation_id):
 # ─── Timestamp Helpers ───────────────────────────────────────────────────────
 
 def build_timestamp_fields(epoch_seconds):
-    """
-    Build protobuf timestamp fields 3, 7, and 10 from an epoch timestamp.
-    Each is a sub-message with: sub-field 1 (varint) = seconds since epoch.
-    Returns raw protobuf bytes containing all three fields.
-    """
     seconds = int(epoch_seconds)
     ts_inner = encode_varint((1 << 3) | 0) + encode_varint(seconds)
     return (
@@ -325,9 +260,7 @@ def build_timestamp_fields(epoch_seconds):
         + encode_length_delimited(10, ts_inner)
     )
 
-
 def has_timestamp_fields(inner_blob):
-    """Check if the inner blob already contains timestamp fields (3, 7, or 10)."""
     if not inner_blob:
         return False
     try:
@@ -347,13 +280,11 @@ def has_timestamp_fields(inner_blob):
 # ─── Interactive Workspace Assignment ────────────────────────────────────────
 
 def _prompt_valid_folder(prompt_text):
-    """Keep asking for a folder until user gives a valid one or presses Enter."""
     while True:
         raw = input(prompt_text).strip()
         if raw == "":
             return None
         folder = raw.strip('"').strip("'").rstrip("\\/")
-        # Accept remote URIs without filesystem validation
         if _is_remote_uri(folder):
             print(f"    + Mapped remote URI: {folder}")
             return folder
@@ -361,32 +292,23 @@ def _prompt_valid_folder(prompt_text):
             print(f"    + Mapped to {folder}")
             return folder
         else:
-            print(f"    x Path not found: {folder}")
-            print(f"      (Make sure the folder exists. Try again or press Enter to skip)")
-
+            print(f"    x Path not found: {folder}\n      (Try again or press Enter to skip)")
 
 def interactive_workspace_assignment(unmapped_entries):
-    """
-    Show unmapped conversations and let user assign workspace paths.
-    unmapped_entries: list of (index, conversation_id, title)
-    Returns dict: {conversation_id: folder_path}
-    """
     if not unmapped_entries:
         return {}
 
-    print()
-    print("  " + "=" * 58)
+    print("\n  " + "=" * 58)
     print("  WORKSPACE ASSIGNMENT (optional)")
     print("  " + "=" * 58)
     print(f"  {len(unmapped_entries)} conversation(s) have no workspace.")
     print("  You can assign each to a workspace folder now,")
-    print("  or press Enter to skip and leave them unassigned.")
-    print()
+    print("  or press Enter to skip and leave them unassigned.\n")
 
     assignments = {}
     batch_path = None
 
-    for idx, cid, title in unmapped_entries:
+    for idx, cid, title, _ in unmapped_entries:
         if batch_path:
             assignments[cid] = batch_path
             print(f"    [{idx:3d}] {title[:45]}  -> {os.path.basename(batch_path)}")
@@ -408,9 +330,8 @@ def interactive_workspace_assignment(unmapped_entries):
                 batch_path = folder
                 assignments[cid] = folder
                 break
-            # Normal path entry
+
             folder = raw.strip('"').strip("'").rstrip("\\/")
-            # Accept remote URIs without filesystem validation
             if _is_remote_uri(folder):
                 print(f"    + Mapped remote URI: {folder}")
                 assignments[cid] = folder
@@ -420,12 +341,10 @@ def interactive_workspace_assignment(unmapped_entries):
                 assignments[cid] = folder
                 break
             else:
-                print(f"    x Path not found: {folder}")
-                print(f"      (Try again or press Enter to skip)")
+                print(f"    x Path not found: {folder}\n      (Try again or press Enter to skip)")
 
     if assignments:
-        print()
-        print(f"  + Assigned workspace to {len(assignments)} conversation(s)")
+        print(f"\n  + Assigned workspace to {len(assignments)} conversation(s)")
     print()
     return assignments
 
@@ -433,14 +352,6 @@ def interactive_workspace_assignment(unmapped_entries):
 # ─── Metadata Extraction ─────────────────────────────────────────────────────
 
 def extract_existing_metadata(db_path):
-    """
-    Read metadata already stored in the database's trajectory data.
-    Returns two dicts:
-      - titles:      {conversation_id: title}  (real, non-fallback titles)
-      - inner_blobs: {conversation_id: raw_inner_protobuf_bytes}
-    The inner_blobs contain workspace URIs, timestamps, tool state, etc.
-    These are preserved so re-running the script doesn't lose data.
-    """
     titles = {}
     inner_blobs = {}
     try:
@@ -470,7 +381,6 @@ def extract_existing_metadata(db_path):
             entry = decoded[pos:pos + length]
             pos += length
 
-            # Parse each entry for UUID (field 1) and info blob (field 2)
             ep, uid, info_b64 = 0, None, None
             while ep < len(entry):
                 t, ep = decode_varint(entry, ep)
@@ -504,19 +414,14 @@ def extract_existing_metadata(db_path):
                         titles[uid] = title
                 except Exception:
                     pass
-
     except Exception:
         pass
 
     return titles, inner_blobs
 
 
-def get_title_from_brain(conversation_id):
-    """
-    Try to extract a title from brain artifact .md files.
-    Returns the first markdown heading found, or None.
-    """
-    brain_path = os.path.join(BRAIN_DIR, conversation_id)
+def get_title_from_brain(conversation_id, brain_dir_base):
+    brain_path = os.path.join(brain_dir_base, conversation_id)
     if not os.path.isdir(brain_path):
         return None
 
@@ -531,56 +436,32 @@ def get_title_from_brain(conversation_id):
                 return first_line.lstrip('# ').strip()[:80]
         except Exception:
             pass
-
     return None
 
 
-def resolve_title(conversation_id, existing_titles):
-    """
-    Determine the best title for a conversation. Priority:
-      1. Brain artifact .md heading
-      2. Existing title from database (preserved from previous run)
-      3. Fallback: date + short UUID
-    Returns (title, source) where source is 'brain', 'preserved', or 'fallback'.
-    """
-    brain_title = get_title_from_brain(conversation_id)
+def resolve_title(cid, existing_titles, conv_info):
+    brain_title = get_title_from_brain(cid, conv_info['brain_dir'])
     if brain_title:
         return brain_title, "brain"
 
-    if conversation_id in existing_titles:
-        return existing_titles[conversation_id], "preserved"
+    if cid in existing_titles:
+        return existing_titles[cid], "preserved"
 
-    conv_file = os.path.join(CONVERSATIONS_DIR, f"{conversation_id}.pb")
-    if os.path.exists(conv_file):
-        mod_time = time.strftime("%b %d", time.localtime(os.path.getmtime(conv_file)))
-        return f"Conversation ({mod_time}) {conversation_id[:8]}", "fallback"
+    if os.path.exists(conv_info['pb_path']):
+        mod_time = time.strftime("%b %d", time.localtime(conv_info['mtime']))
+        return f"Conversation ({mod_time}) {cid[:8]}", "fallback"
 
-    return f"Conversation {conversation_id[:8]}", "fallback"
+    return f"Conversation {cid[:8]}", "fallback"
 
-
-# ─── Protobuf Entry Builder ──────────────────────────────────────────────────
 
 def build_trajectory_entry(conversation_id, title, existing_inner_data=None,
                            workspace_path=None, pb_mtime=None):
-    """
-    Build a single trajectory summary protobuf entry.
-
-    - If existing_inner_data is provided, title (field 1) is replaced but
-      ALL other fields (workspace, timestamps, tool state) are preserved.
-    - If workspace_path is provided and there is no existing workspace,
-      a workspace field (field 9) is injected.
-    - If pb_mtime is provided and timestamps are missing,
-      timestamp fields (3, 7, 10) are injected for proper sorting.
-    """
     if existing_inner_data:
         preserved_fields = strip_field_from_protobuf(existing_inner_data, 1)
         inner_info = encode_string_field(1, title) + preserved_fields
-        # Override workspace if user assigned a new one
         if workspace_path:
-            # Strip old workspace (field 9) and inject the new one
             inner_info = strip_field_from_protobuf(inner_info, 9)
             inner_info += build_workspace_field(workspace_path)
-        # Inject timestamps if missing
         if pb_mtime and not has_timestamp_fields(existing_inner_data):
             inner_info += build_timestamp_fields(pb_mtime)
     else:
@@ -598,18 +479,85 @@ def build_trajectory_entry(conversation_id, title, existing_inner_data=None,
     return entry
 
 
+# ─── Remote SSH Download Helper ───────────────────────────────────────────────
+
+def fetch_remote_files(host, user, pwd, remote_home):
+    """Connects via SSH and downloads the artifacts to a temporary directory."""
+    try:
+        import paramiko
+    except ImportError:
+        print("\n  [!] ERROR: 'paramiko' library is required to fetch remote files.")
+        print("  Please install it by running the following command:")
+        print("    pip install paramiko\n")
+        sys.exit(1)
+
+    print(f"\n  Connecting to {user}@{host}...")
+    ssh = paramiko.SSHClient()
+    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    
+    try:
+        # allow_agent=False and look_for_keys=False prevent paramiko from trying
+        # to use incompatible local SSH agents or keys, strictly enforcing password auth.
+        ssh.connect(host, username=user, password=pwd, timeout=10,
+                    look_for_keys=False, allow_agent=False)
+    except Exception as e:
+        print(f"  [!] Failed to connect to remote server: {e}")
+        sys.exit(1)
+
+    sftp = ssh.open_sftp()
+    
+    # Path resolution on remote Linux server using user-provided home path
+    remote_home = remote_home.rstrip('/')
+    remote_base = f"{remote_home}/.gemini/antigravity"
+    remote_conv = f"{remote_base}/conversations"
+    remote_brain = f"{remote_base}/brain"
+
+    # Create local temporary directories
+    temp_dir = tempfile.mkdtemp(prefix="antigravity_remote_")
+    local_conv = os.path.join(temp_dir, "conversations")
+    local_brain = os.path.join(temp_dir, "brain")
+
+    def download_dir(rem_dir, loc_dir):
+        try:
+            os.makedirs(loc_dir, exist_ok=True)
+            for item in sftp.listdir_attr(rem_dir):
+                rem_path = f"{rem_dir}/{item.filename}"
+                loc_path = os.path.join(loc_dir, item.filename)
+                
+                if stat.S_ISDIR(item.st_mode):
+                    download_dir(rem_path, loc_path)
+                else:
+                    sftp.get(rem_path, loc_path)
+                    # Preserve modified time for proper sorting
+                    os.utime(loc_path, (item.st_atime, item.st_mtime))
+        except IOError:
+            # File/Folder doesn't exist on remote
+            pass
+
+    print(f"  Downloading remote conversations from: {remote_conv}")
+    download_dir(remote_conv, local_conv)
+    
+    print(f"  Downloading remote brain artifacts from: {remote_brain}")
+    download_dir(remote_brain, local_brain)
+
+    sftp.close()
+    ssh.close()
+    
+    print("  Successfully fetched remote data.\n")
+    return temp_dir, local_conv, local_brain
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     print()
     print("=" * 62)
-    print("   Antigravity Conversation Fix  v1.04")
-    print("   Rebuilds your conversation index — sorted by date")
+    print("   Antigravity Conversation Fix  v1.08")
+    print("   Rebuilds your local & remote index — sorted by date")
     print("=" * 62)
     print()
 
-    # ── Check if Antigravity is running (Windows only) ────────────────────
-
+    # ── Check if Antigravity is running ─────────────────────────────────────
     if _SYSTEM == "Windows":
         try:
             result = subprocess.run(
@@ -618,223 +566,236 @@ def main():
             )
             if 'antigravity.exe' in result.stdout.lower():
                 print("  WARNING: Antigravity is still running!")
-                print()
                 print("  The fix will NOT work correctly while Antigravity is open.")
-                print("  Please close it first: File > Exit, or kill from Task Manager.")
-                print()
-                choice = input("  Close Antigravity and press Enter to continue (or type Q to quit): ")
+                print("  Please close it first: File > Exit, or kill from Task Manager.\n")
+                choice = input("  Close Antigravity and press Enter to continue (or Q to quit): ")
                 if choice.strip().lower() == 'q':
                     return 1
                 print()
         except Exception:
             pass
     else:
-        # Linux / macOS: check for antigravity process
         try:
-            result = subprocess.run(
-                ['pgrep', '-f', 'antigravity'],
-                capture_output=True, text=True
-            )
+            result = subprocess.run(['pgrep', '-f', 'antigravity'], capture_output=True, text=True)
             if result.stdout.strip():
                 print("  WARNING: Antigravity may still be running!")
-                print("  Please close it before proceeding.")
-                print()
-                choice = input("  Press Enter to continue anyway (or type Q to quit): ")
+                print("  Please close it before proceeding.\n")
+                choice = input("  Press Enter to continue anyway (or Q to quit): ")
                 if choice.strip().lower() == 'q':
                     return 1
                 print()
         except Exception:
             pass
 
-    # ── Validate paths ──────────────────────────────────────────────────────
-
     if not os.path.exists(DB_PATH):
-        print(f"  ERROR: Database not found at:")
-        print(f"    {DB_PATH}")
-        print()
-        print("  Make sure Antigravity has been installed and opened at least once.")
+        print(f"  ERROR: Database not found at:\n    {DB_PATH}\n")
+        print("  Make sure Antigravity has been installed locally at least once.")
         input("\n  Press Enter to close...")
         return 1
 
-    if not os.path.isdir(CONVERSATIONS_DIR):
-        print(f"  ERROR: Conversations directory not found at:")
-        print(f"    {CONVERSATIONS_DIR}")
-        input("\n  Press Enter to close...")
-        return 1
+    # ── Interactive Remote Setup ────────────────────────────────────────────
+    
+    print("  Do you also want to fix remote conversations?")
+    print("  (This will SSH into your server, grab the remote files, and")
+    print("  merge them with your local database).")
+    use_remote = input("  [y/N]: ").strip().lower() == 'y'
+    
+    temp_remote_dir = None
+    remote_conv_dir = None
+    remote_brain_dir = None
 
-    # ── Discover conversations ──────────────────────────────────────────────
+    if use_remote:
+        host = input("    Remote IP/Hostname: ").strip()
+        user = input("    Remote Username: ").strip()
+        pwd = getpass.getpass("    Remote Password: ")
+        
+        default_home = f"/home/{user}"
+        home_input = input(f"    Remote Home Path (default: {default_home}): ").strip()
+        remote_home = home_input if home_input else default_home
 
-    conv_files = [f for f in os.listdir(CONVERSATIONS_DIR) if f.endswith('.pb')]
+        temp_remote_dir, remote_conv_dir, remote_brain_dir = fetch_remote_files(host, user, pwd, remote_home)
 
-    if not conv_files:
-        print("  No conversations found on disk. Nothing to fix.")
-        input("\n  Press Enter to close...")
-        return 0
+    try:
+        # ── Discover conversations (Merge Local & Remote) ───────────────────────
+        
+        all_conversations = {} # map cid -> info dict
+        
+        def add_conversations(conv_dir, brain_dir, is_remote_flag):
+            if not os.path.isdir(conv_dir):
+                return
+            for f in os.listdir(conv_dir):
+                if f.endswith('.pb'):
+                    cid = f[:-3]
+                    pb_path = os.path.join(conv_dir, f)
+                    mtime = os.path.getmtime(pb_path)
+                    
+                    # If exists, keep the one with the newest modified time
+                    if cid not in all_conversations or mtime > all_conversations[cid]['mtime']:
+                        all_conversations[cid] = {
+                            'pb_path': pb_path,
+                            'brain_dir': brain_dir,
+                            'mtime': mtime,
+                            'is_remote': is_remote_flag
+                        }
 
-    conv_files.sort(
-        key=lambda f: os.path.getmtime(os.path.join(CONVERSATIONS_DIR, f)),
-        reverse=True
-    )
-    conversation_ids = [f[:-3] for f in conv_files]
+        add_conversations(LOCAL_CONV_DIR, LOCAL_BRAIN_DIR, is_remote_flag=False)
+        if use_remote:
+            add_conversations(remote_conv_dir, remote_brain_dir, is_remote_flag=True)
 
-    print(f"  Found {len(conversation_ids)} conversations on disk")
-    print()
+        if not all_conversations:
+            print("  No conversations found locally or remotely.")
+            input("\n  Press Enter to close...")
+            return 0
 
-    # ── Preserve existing metadata ──────────────────────────────────────────
+        # Sort by latest modified time (newest first)
+        conversation_ids = sorted(
+            all_conversations.keys(),
+            key=lambda c: all_conversations[c]['mtime'],
+            reverse=True
+        )
 
-    print("  Reading existing metadata from database...")
-    existing_titles, existing_inner_blobs = extract_existing_metadata(DB_PATH)
-    ws_count = sum(1 for v in existing_inner_blobs.values()
-                   if extract_workspace_hint(v))
-    print(f"  Found {len(existing_titles)} existing titles to preserve")
-    print(f"  Found {ws_count} conversations with workspace metadata")
-    print()
-
-    # ── Scan conversations ──────────────────────────────────────────────────
-
-    print("  Scanning conversations (newest first):")
-    print("  " + "-" * 58)
-
-    resolved = []  # (cid, title, source, inner_data, has_ws)
-    stats = {"brain": 0, "preserved": 0, "fallback": 0}
-    markers = {"brain": "+", "preserved": "~", "fallback": "?"}
-
-    for i, cid in enumerate(conversation_ids, 1):
-        title, source = resolve_title(cid, existing_titles)
-        inner_data = existing_inner_blobs.get(cid)
-        has_ws = bool(inner_data and extract_workspace_hint(inner_data))
-        resolved.append((cid, title, source, inner_data, has_ws))
-        stats[source] += 1
-        marker = markers[source]
-        ws_flag = " [WS]" if has_ws else ""
-        print(f"    [{i:3d}] {marker} {title[:50]}{ws_flag}")
-
-    print("  " + "-" * 58)
-    print(f"  Legend: [+] brain  [~] preserved  [?] fallback  [WS] workspace")
-    print(f"  Totals: {stats['brain']} brain, {stats['preserved']} preserved, {stats['fallback']} fallback")
-    print()
-
-    # ── Workspace assignment ───────────────────────────────────────────────
-
-    unmapped = [(i, cid, title)
-                for i, (cid, title, _, inner_data, has_ws) in enumerate(resolved, 1)
-                if not has_ws]
-
-    ws_assignments = {}  # cid -> folder_path
-
-    if unmapped:
-        print(f"  {len(unmapped)} conversation(s) have no workspace assigned.")
+        print(f"  Found {len(conversation_ids)} total conversations across sources.")
         print()
-        print("  Press Enter or 1: Auto-assign workspaces (recommended)")
-        print("  Press 2:          Auto-assign + manually assign the rest")
-        print()
-        choice = input("  Your choice: ").strip()
 
-        # Auto-infer from brain artifacts (both options do this)
-        if os.path.isdir(BRAIN_DIR):
-            print()
-            print("  Auto-assigning workspaces from brain artifacts...")
+        # ── Preserve existing metadata ──────────────────────────────────────────
+        print("  Reading existing metadata from local database...")
+        existing_titles, existing_inner_blobs = extract_existing_metadata(DB_PATH)
+        ws_count = sum(1 for v in existing_inner_blobs.values() if extract_workspace_hint(v))
+        print(f"  Found {len(existing_titles)} existing titles to preserve")
+        print(f"  Found {ws_count} conversations with workspace metadata\n")
+
+        # ── Scan conversations ──────────────────────────────────────────────────
+        print("  Scanning conversations (newest first):")
+        print("  " + "-" * 58)
+
+        resolved = []  # (cid, title, source, inner_data, has_ws, is_remote)
+        stats = {"brain": 0, "preserved": 0, "fallback": 0}
+        markers = {"brain": "+", "preserved": "~", "fallback": "?"}
+
+        for i, cid in enumerate(conversation_ids, 1):
+            conv_info = all_conversations[cid]
+            title, source = resolve_title(cid, existing_titles, conv_info)
+            inner_data = existing_inner_blobs.get(cid)
+            has_ws = bool(inner_data and extract_workspace_hint(inner_data))
+            
+            resolved.append((cid, title, source, inner_data, has_ws, conv_info))
+            stats[source] += 1
+            marker = markers[source]
+            ws_flag = " [WS]" if has_ws else ""
+            remote_flag = " [Remote]" if conv_info['is_remote'] else ""
+            print(f"    [{i:3d}] {marker} {title[:45]}{ws_flag}{remote_flag}")
+
+        print("  " + "-" * 58)
+        print(f"  Legend: [+] brain  [~] preserved  [?] fallback  [WS] workspace")
+        print(f"  Totals: {stats['brain']} brain, {stats['preserved']} preserved, {stats['fallback']} fallback\n")
+
+        # ── Workspace assignment ───────────────────────────────────────────────
+        unmapped = [(i, cid, title, conv_info)
+                    for i, (cid, title, _, _, has_ws, conv_info) in enumerate(resolved, 1)
+                    if not has_ws]
+
+        ws_assignments = {}
+
+        if unmapped:
+            print(f"  {len(unmapped)} conversation(s) have no workspace assigned.\n")
+            print("  Press Enter or 1: Auto-assign workspaces (recommended)")
+            print("  Press 2:          Auto-assign + manually assign the rest\n")
+            choice = input("  Your choice: ").strip()
+
+            print("\n  Auto-assigning workspaces from brain artifacts...")
             auto_count = 0
-            for idx, cid, title in unmapped:
-                inferred = infer_workspace_from_brain(cid)
-                if inferred and os.path.isdir(inferred):
+            for idx, cid, title, conv_info in unmapped:
+                inferred = infer_workspace_from_brain(cid, conv_info['brain_dir'])
+                if inferred:
                     ws_assignments[cid] = inferred
                     auto_count += 1
                     print(f"    [{idx:3d}] -> {os.path.basename(inferred)}")
+                    
             if auto_count:
-                print(f"  Auto-assigned {auto_count} workspace(s)")
+                print(f"  Auto-assigned {auto_count} workspace(s)\n")
             else:
-                print("  No workspaces could be auto-detected.")
-            print()
+                print("  No workspaces could be auto-detected.\n")
 
-        # Option 2: also do manual assignment for the rest
-        if choice == '2':
-            still_unmapped = [(idx, cid, title)
-                              for idx, cid, title in unmapped
-                              if cid not in ws_assignments]
-            if still_unmapped:
-                user_assignments = interactive_workspace_assignment(still_unmapped)
-                ws_assignments.update(user_assignments)
-            else:
-                print("  All conversations were auto-assigned — nothing left to assign manually.")
-                print()
+            if choice == '2':
+                still_unmapped = [(idx, cid, title, conv_info)
+                                  for idx, cid, title, conv_info in unmapped
+                                  if cid not in ws_assignments]
+                if still_unmapped:
+                    user_assignments = interactive_workspace_assignment(still_unmapped)
+                    ws_assignments.update(user_assignments)
 
-    # ── Build the new index ─────────────────────────────────────────────────
+        # ── Build the new index ─────────────────────────────────────────────────
+        print("  Building final index...")
+        result_bytes = b""
+        ws_total = 0
+        ts_injected = 0
 
-    print("  Building final index...")
-    result_bytes = b""
-    ws_total = 0
-    ts_injected = 0
+        for cid, title, source, inner_data, has_ws, conv_info in resolved:
+            ws_path = ws_assignments.get(cid)
+            pb_mtime = conv_info['mtime']
 
-    for cid, title, source, inner_data, has_ws in resolved:
-        ws_path = ws_assignments.get(cid)
-        pb_path = os.path.join(CONVERSATIONS_DIR, f"{cid}.pb")
-        pb_mtime = os.path.getmtime(pb_path) if os.path.exists(pb_path) else None
+            entry = build_trajectory_entry(cid, title, inner_data, ws_path, pb_mtime)
+            result_bytes += encode_length_delimited(1, entry)
 
-        entry = build_trajectory_entry(cid, title, inner_data, ws_path, pb_mtime)
-        result_bytes += encode_length_delimited(1, entry)
+            if has_ws or ws_path:
+                ws_total += 1
+            if pb_mtime and (not inner_data or not has_timestamp_fields(inner_data)):
+                ts_injected += 1
 
-        if has_ws or ws_path:
-            ws_total += 1
-        if pb_mtime and (not inner_data or not has_timestamp_fields(inner_data)):
-            ts_injected += 1
+        print(f"  Workspace: {ws_total} mapped  |  Timestamps injected: {ts_injected}\n")
 
-    print(f"  Workspace: {ws_total} mapped  |  Timestamps injected: {ts_injected}")
-    print()
+        # ── Backup current data ─────────────────────────────────────────────────
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
 
-    # ── Backup current data ─────────────────────────────────────────────────
-
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-
-    cur.execute(
-        "SELECT value FROM ItemTable "
-        "WHERE key='antigravityUnifiedStateSync.trajectorySummaries'"
-    )
-    row = cur.fetchone()
-
-    backup_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), BACKUP_FILENAME)
-    if row and row[0]:
-        with open(backup_path, 'w', encoding='utf-8') as f:
-            f.write(row[0])
-        print(f"  Backup saved to: {BACKUP_FILENAME}")
-
-    # ── Write the new index ─────────────────────────────────────────────────
-
-    encoded = base64.b64encode(result_bytes).decode('utf-8')
-
-    if row:
         cur.execute(
-            "UPDATE ItemTable SET value=? "
-            "WHERE key='antigravityUnifiedStateSync.trajectorySummaries'",
-            (encoded,)
+            "SELECT value FROM ItemTable "
+            "WHERE key='antigravityUnifiedStateSync.trajectorySummaries'"
         )
-    else:
-        cur.execute(
-            "INSERT INTO ItemTable (key, value) "
-            "VALUES ('antigravityUnifiedStateSync.trajectorySummaries', ?)",
-            (encoded,)
-        )
+        row = cur.fetchone()
 
-    conn.commit()
-    conn.close()
+        backup_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), BACKUP_FILENAME)
+        if row and row[0]:
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                f.write(row[0])
+            print(f"  Backup saved to: {BACKUP_FILENAME}")
 
-    # ── Done ────────────────────────────────────────────────────────────────
+        # ── Write the new index ─────────────────────────────────────────────────
+        encoded = base64.b64encode(result_bytes).decode('utf-8')
 
-    total = len(conversation_ids)
-    print()
-    print("  " + "=" * 58)
-    print(f"  SUCCESS! Rebuilt index with {total} conversations.")
-    print("  " + "=" * 58)
-    print()
-    print("  NEXT STEPS:")
-    print("    1. Make sure Antigravity is fully closed")
-    print("    2. REBOOT your PC (full restart, not just app restart)")
-    print("    3. Open Antigravity — conversations should appear sorted by date")
-    print()
-    input("  Press Enter to close...")
+        if row:
+            cur.execute(
+                "UPDATE ItemTable SET value=? "
+                "WHERE key='antigravityUnifiedStateSync.trajectorySummaries'",
+                (encoded,)
+            )
+        else:
+            cur.execute(
+                "INSERT INTO ItemTable (key, value) "
+                "VALUES ('antigravityUnifiedStateSync.trajectorySummaries', ?)",
+                (encoded,)
+            )
+
+        conn.commit()
+        conn.close()
+
+        # ── Done ────────────────────────────────────────────────────────────────
+        print("\n  " + "=" * 58)
+        print(f"  SUCCESS! Rebuilt index with {len(conversation_ids)} conversations.")
+        print("  " + "=" * 58)
+        print("\n  NEXT STEPS:")
+        print("    1. Make sure Antigravity is fully closed")
+        print("    2. REBOOT your PC (full restart, not just app restart)")
+        print("    3. Open Antigravity — local and remote conversations should appear together")
+        print()
+        input("  Press Enter to close...")
+        
+    finally:
+        # ── Cleanup temporary files ──────────────────────────────────────────────
+        if temp_remote_dir and os.path.exists(temp_remote_dir):
+            shutil.rmtree(temp_remote_dir, ignore_errors=True)
+
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
