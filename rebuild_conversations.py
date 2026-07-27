@@ -291,6 +291,27 @@ DB_PATHS = _existing_paths(*_DB_CANDIDATES)
 BACKUP_FILENAME = "trajectorySummaries_backup.txt"
 
 
+def _backup_dir():
+    """
+    Folder where rollback backups are written.
+
+    When frozen with PyInstaller (--onefile), __file__ points inside the
+    temporary _MEIxxxx extraction folder, which Windows deletes the moment
+    the exe exits — backups written there are silently destroyed and the
+    user has no way to roll back. Use the folder the exe actually lives in.
+    Falls back to the current working directory if that folder is not
+    writable (e.g. exe launched from a read-only location).
+    """
+    if getattr(sys, "frozen", False):
+        base = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+
+    if os.access(base, os.W_OK):
+        return base
+    return os.getcwd()
+
+
 def _find_brain_path(conversation_id):
     """Return the first existing brain folder for this conversation across all locations."""
     for brain_dir in _ALL_BRAIN_DIRS:
@@ -893,11 +914,25 @@ def write_index_to_database(db_path, encoded_value, backup_suffix):
     )
     row = cur.fetchone()
 
-    backup_name = f"trajectorySummaries_backup_{backup_suffix}.txt" if backup_suffix else BACKUP_FILENAME
-    backup_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), backup_name)
+    # Timestamped so re-running never overwrites an earlier backup — otherwise
+    # a second run would replace the pristine pre-tool state with this tool's
+    # own previous output, leaving nothing to roll back to.
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    if backup_suffix:
+        backup_name = f"trajectorySummaries_backup_{backup_suffix}_{stamp}.txt"
+    else:
+        backup_name = f"trajectorySummaries_backup_{stamp}.txt"
+    backup_path = os.path.join(_backup_dir(), backup_name)
     if row and row[0]:
-        with open(backup_path, 'w', encoding='utf-8') as f:
-            f.write(row[0])
+        try:
+            with open(backup_path, 'w', encoding='utf-8') as f:
+                f.write(row[0])
+        except OSError as e:
+            conn.close()
+            raise RuntimeError(
+                f"Could not write rollback backup to {backup_path}: {e}\n"
+                f"    Refusing to modify the database without a backup."
+            )
 
     if row:
         cur.execute(
@@ -914,7 +949,7 @@ def write_index_to_database(db_path, encoded_value, backup_suffix):
 
     conn.commit()
     conn.close()
-    return backup_name if row and row[0] else None
+    return backup_path if row and row[0] else None
 
 
 def get_title_from_brain(conversation_id):
@@ -1296,13 +1331,15 @@ def main():
     encoded = base64.b64encode(result_bytes).decode('utf-8')
 
     print("  Writing rebuilt index to database(s):")
+    saved_backups = []
     for db_path in DB_PATHS:
         app_name = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(db_path))))
         suffix = re.sub(r"[^A-Za-z0-9]+", "_", app_name).strip("_").lower()
-        backup_name = write_index_to_database(db_path, encoded, suffix)
+        backup_path = write_index_to_database(db_path, encoded, suffix)
         print(f"    {app_name}: updated")
-        if backup_name:
-            print(f"      backup: {backup_name}")
+        if backup_path:
+            saved_backups.append(backup_path)
+            print(f"      backup: {backup_path}")
 
     # ── Done ────────────────────────────────────────────────────────────────
 
@@ -1321,6 +1358,11 @@ def main():
         print("    2. REBOOT your PC (full restart, not just app restart)")
         print("    3. Open Antigravity — conversations should appear sorted by date")
     print()
+    if saved_backups:
+        print("  ROLLBACK: your previous index was saved to")
+        print(f"    {_backup_dir()}")
+        print("  Keep those .txt files if you may want to undo this.")
+        print()
     input("  Press Enter to close...")
     return 0
 
