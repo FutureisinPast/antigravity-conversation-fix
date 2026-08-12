@@ -1,0 +1,29 @@
+# Executables
+*.exe
+
+# backup files 
+*.txt
+
+
+# PyInstaller build outputs
+build/
+dist/
+*.spec
+
+# Python caches and bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+.DS_Store
