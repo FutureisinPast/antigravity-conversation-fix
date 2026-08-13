@@ -1,0 +1,22 @@
+# Release binaries and local PyInstaller output
+*.exe
+/build/
+/dist/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE files
+.idea/
+.vscode/
+*.code-workspace

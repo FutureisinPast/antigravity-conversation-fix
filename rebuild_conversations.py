@@ -15,8 +15,8 @@ Fixes:
 Usage:
   1. CLOSE Antigravity completely (File > Exit, or kill from Task Manager)
   2. Run this script (or use run.bat on Windows)
-  3. REBOOT your PC (full restart, not just app restart)
-  4. Open Antigravity — your conversations should appear, sorted by date
+  3. Open Antigravity — your conversations should appear, sorted by date
+  4. Reboot only if the changes do not appear after reopening Antigravity
 
 Requirements: Python 3.7+ (no external packages needed)
 License: MIT
@@ -1353,10 +1353,11 @@ def main():
     if _IS_WSL:
         print("    1. Make sure Antigravity is fully closed on the Windows side")
         print("    2. Open Antigravity — conversations should appear sorted by date")
+        print("    3. If changes do not appear, reboot and open Antigravity again")
     else:
         print("    1. Make sure Antigravity is fully closed")
-        print("    2. REBOOT your PC (full restart, not just app restart)")
-        print("    3. Open Antigravity — conversations should appear sorted by date")
+        print("    2. Open Antigravity — conversations should appear sorted by date")
+        print("    3. If changes do not appear, reboot and open Antigravity again")
     print()
     if saved_backups:
         print("  ROLLBACK: your previous index was saved to")

@@ -11,7 +11,7 @@ Your Antigravity conversation history disappeared? Conversations showing in the 
 5. When prompted for workspace assignment, choose an option:
    - **Press Enter or 1** — auto-assigns workspaces from your brain files *(recommended)*
    - **Press 2** — auto-assigns first, then lets you manually assign any remaining conversations
-6. Restart your PC, then open Antigravity — your conversations are back, sorted by date
+6. Open Antigravity — your conversations are back, sorted by date. A PC restart is normally not required if Antigravity was fully closed; reboot only if the changes do not appear.
 
 > **No Python or developer tools required.** Just download, run, done.
 
@@ -147,7 +147,7 @@ The tool automatically detects WSL, resolves your Windows `%APPDATA%` path, and 
 ## FAQ
 
 **Q: Do I really need to restart my PC?**
-A: A full restart is the safest way to ensure Antigravity picks up the changes. In most cases, simply closing and reopening Antigravity works too.
+A: No. If Antigravity was fully closed before the repair, reopen it afterward. Reboot your PC only if the changes do not appear.
 
 **Q: Why do some titles show as "Conversation (Mar 10) abc12345"?**
 A: Those conversations don't have brain artifacts, and their original titles weren't in the database. Future re-runs will preserve any titles the app generates going forward.
