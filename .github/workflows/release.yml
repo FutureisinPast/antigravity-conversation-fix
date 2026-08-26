@@ -23,6 +23,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+
       - name: Install PyInstaller
         run: python -m pip install pyinstaller==6.19.0
 
@@ -46,13 +49,25 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
       - name: Download executable
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: Antigravity_Conversation_Fix
           path: release-assets
 
+      - name: Set release title
+        id: release_metadata
+        run: |
+          version="${GITHUB_REF_NAME#V}"
+          version="${version#v}"
+          echo "name=Antigravity Conversation Fix v${version}" >> "$GITHUB_OUTPUT"
+
       - name: Publish GitHub release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
+          name: ${{ steps.release_metadata.outputs.name }}
+          body_path: RELEASE_NOTES.md
           files: release-assets/Antigravity_Conversation_Fix.exe

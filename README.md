@@ -32,6 +32,8 @@ Your Antigravity conversation history disappeared? Conversations showing in the 
 | Conversations split across multiple folders after upgrade | ✅ Multi-folder merge with dedup *(v1.06+)* |
 | Only one Antigravity variant fixed when both installed | ✅ Writes index to ALL databases *(v1.06+)* |
 | New `.db` conversation format not detected | ✅ Supports both `.pb` and `.db` files *(v1.06+)* |
+| Placeholder titles despite usable conversation text | ✅ Derives titles from the first `.db` user prompt *(v1.07+)* |
+| Recent `.db` messages disappear from the sidebar later | ✅ Refreshes updated timestamps on re-run *(v1.07+)* |
 | Running from WSL requires manual file copying | ✅ Native WSL path detection *(v1.05+)* |
 | `python` command fails on macOS/Linux | ✅ Auto-detects Python 3, with built-in fallback *(v1.05+)* |
 
@@ -51,12 +53,13 @@ Antigravity stores conversation data in two places:
 
 > **Note:** The tool automatically detects all folder name variants — `antigravity`, `antigravity-ide`, `antigravity-backup`, `Antigravity`, and `Antigravity IDE` — and merges conversations from all locations. Duplicates are automatically removed (newest location wins).
 
-When the index gets corrupted, conversations still exist on disk but don't show up in the sidebar. This tool scans your conversation files, sorts them by date, pulls titles from brain artifacts, and writes a clean index back to the database.
+When the index gets corrupted, conversations still exist on disk but don't show up in the sidebar. This tool scans your conversation files, sorts them by date, pulls titles from brain artifacts or derives them from the first prompt in newer conversation databases, and writes a clean index back to the database.
 
 **Title resolution priority:**
 1. Titles already in the database (canonical Antigravity titles — preserved across re-runs)
 2. Brain artifact `.md` headings (for conversations not yet indexed)
-3. Fallback: `Conversation (date) short-id`
+3. A meaningful title derived from the first user prompt in a `.db` conversation
+4. Fallback: `Conversation (date) short-id`
 
 ## Output Legend
 
@@ -64,10 +67,17 @@ When the index gets corrupted, conversations still exist on disk but don't show 
 |---|---|
 | `[+]` | Title extracted from brain artifact |
 | `[~]` | Title preserved from existing database |
+| `[=]` | Title derived from a `.db` conversation's first user prompt |
 | `[?]` | Fallback title (no source available) |
 | `[WS]` | Workspace metadata preserved or recovered |
 
 ## Changelog
+
+### v1.07
+- **Fix:** **Meaningful `.db` titles** — derives a concise title from the first user prompt when neither the existing index nor brain artifacts contain a title, replacing many date-and-ID placeholders.
+- **Fix:** **Recent-message visibility** — when an existing `.db` conversation file is newer than its indexed update time, refreshes only the sidebar's updated timestamp. Created time, workspace mapping, and unknown metadata remain unchanged.
+- **Safety:** The tool now exits without scanning or writing when Antigravity is running, preventing the app from later overwriting the repaired index.
+- **Tests:** Generated SQLite/protobuf fixtures cover title extraction, malformed input, title priority, timestamp refresh, metadata preservation, and the active-process abort.
 
 ### v1.06
 - **New:** **Multi-folder conversation merge** — scans `antigravity-ide`, `antigravity`, and `antigravity-backup` folders, merges all conversations with deduplication (newest folder wins). Users who upgraded from v1.x to v2.x no longer lose conversations that were only in the old or backup folder.
@@ -138,7 +148,7 @@ The tool automatically detects WSL, resolves your Windows `%APPDATA%` path, and 
 ## Safety
 
 - **Automatic backup** — your current index is saved to `trajectorySummaries_backup.txt` before any changes
-- **Non-destructive** — conversation files (`*.pb`) are never modified, only the sidebar index is rebuilt
+- **Non-destructive** — conversation files (`*.pb` and `*.db`) are never modified, only the sidebar index is rebuilt
 - **Metadata-preserving** — workspace assignments, timestamps, and other internal state are retained *(v1.01+)*
 - **Idempotent** — safe to run multiple times
 
@@ -150,10 +160,13 @@ The tool automatically detects WSL, resolves your Windows `%APPDATA%` path, and 
 A: No. If Antigravity was fully closed before the repair, reopen it afterward. Reboot your PC only if the changes do not appear.
 
 **Q: Why do some titles show as "Conversation (Mar 10) abc12345"?**
-A: Those conversations don't have brain artifacts, and their original titles weren't in the database. Future re-runs will preserve any titles the app generates going forward.
+A: v1.07+ derives a meaningful title from the first user prompt in newer `.db` conversations. A placeholder remains only when no existing index title, brain heading, or usable first prompt is available.
+
+**Q: Why can recent messages disappear from the sidebar again later?**
+A: A conversation's `.db` file can be updated after the sidebar index was rebuilt. Re-run v1.07+ with Antigravity fully closed; the tool refreshes that conversation's updated time while preserving its created time and other metadata.
 
 **Q: Can I run this while Antigravity is open?**
-A: The tool will detect if Antigravity is running and warn you. It's recommended to close it first so the app doesn't overwrite your fix when it exits.
+A: No. The tool exits without making changes if Antigravity is running, because the app can overwrite the repaired index when it exits.
 
 **Q: I ran v1.0 and my workspace chats were removed. Can I get them back?**
 A: Yes! v1.03+ can auto-recover most workspace assignments by scanning your brain artifact files. When prompted, press Enter or 1 for auto-assignment. If some conversations can't be auto-detected, choose option 2 to manually assign them.

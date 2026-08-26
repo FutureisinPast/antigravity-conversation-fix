@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Antigravity Conversation Fix  (v1.05)
+Antigravity Conversation Fix  (v1.07)
 =============================
 Rebuilds the Antigravity conversation index so all your chat history
 appears correctly — sorted by date (newest first) with proper titles.
@@ -61,7 +61,7 @@ import webbrowser
 from urllib.parse import quote, unquote
 from urllib.request import urlopen, Request
 
-_CURRENT_VERSION = "1.06"
+_CURRENT_VERSION = "1.07"
 _GITHUB_REPO = "FutureisinPast/antigravity-conversation-fix"
 _RELEASES_URL = f"https://github.com/{_GITHUB_REPO}/releases/latest"
 
@@ -415,6 +415,30 @@ def strip_field_from_protobuf(data, target_field_number):
     return remaining
 
 
+def iter_length_delimited_fields(data, target_field_number):
+    """Yield well-formed length-delimited values for one protobuf field."""
+    pos = 0
+    try:
+        while pos < len(data):
+            tag, pos = decode_varint(data, pos)
+            field_number, wire_type = tag >> 3, tag & 7
+            if wire_type == 2:
+                length, pos = decode_varint(data, pos)
+                end = pos + length
+                if end > len(data):
+                    return
+                if field_number == target_field_number:
+                    yield data[pos:end]
+                pos = end
+            else:
+                new_pos = skip_protobuf_field(data, pos, wire_type)
+                if new_pos <= pos or new_pos > len(data):
+                    return
+                pos = new_pos
+    except Exception:
+        return
+
+
 # ─── Protobuf Write Helpers ──────────────────────────────────────────────────
 
 def encode_length_delimited(field_number, data):
@@ -699,6 +723,34 @@ def build_timestamp_fields(epoch_seconds):
     )
 
 
+def build_timestamp_field(field_number, epoch_seconds):
+    """Build one protobuf timestamp field with seconds in nested field 1."""
+    ts_inner = encode_varint((1 << 3) | 0) + encode_varint(int(epoch_seconds))
+    return encode_length_delimited(field_number, ts_inner)
+
+
+def extract_timestamp_seconds(inner_blob, field_number=3):
+    """Return the newest seconds value found in a repeated timestamp field."""
+    values = []
+    for timestamp_blob in iter_length_delimited_fields(inner_blob or b"", field_number):
+        pos = 0
+        try:
+            while pos < len(timestamp_blob):
+                tag, pos = decode_varint(timestamp_blob, pos)
+                nested_field, wire_type = tag >> 3, tag & 7
+                if nested_field == 1 and wire_type == 0:
+                    seconds, pos = decode_varint(timestamp_blob, pos)
+                    values.append(seconds)
+                    break
+                new_pos = skip_protobuf_field(timestamp_blob, pos, wire_type)
+                if new_pos <= pos or new_pos > len(timestamp_blob):
+                    break
+                pos = new_pos
+        except Exception:
+            continue
+    return max(values) if values else None
+
+
 def has_timestamp_fields(inner_blob):
     """Check if the inner blob already contains timestamp fields (3, 7, or 10)."""
     if not inner_blob:
@@ -952,6 +1004,84 @@ def write_index_to_database(db_path, encoded_value, backup_suffix):
     return backup_path if row and row[0] else None
 
 
+def _open_sqlite_readonly(db_path):
+    """Open an existing SQLite file without allowing SQLite to create it."""
+    if not os.path.isfile(db_path):
+        raise FileNotFoundError(db_path)
+    absolute = os.path.abspath(db_path).replace("\\", "/")
+    uri = "file:" + quote(absolute, safe="/:") + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+def _quote_sqlite_identifier(identifier):
+    """Safely quote a SQLite table or column identifier."""
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _find_step_table(conn):
+    """Return the quoted step table name and whether it has an idx column."""
+    cursor = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    )
+    for (table_name,) in cursor.fetchall():
+        quoted = _quote_sqlite_identifier(table_name)
+        columns = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(" + quoted + ")").fetchall()
+        }
+        if {"step_type", "step_payload"}.issubset(columns):
+            return quoted, "idx" in columns
+    return None, False
+
+
+def extract_title_from_conversation_db(db_path):
+    """
+    Derive a meaningful title from the first user prompt in a v2 conversation.
+
+    The first prompt text is protobuf field 2 nested inside field 19 of the
+    first step_type=14 payload. Conversation databases are opened read-only.
+    """
+    conn = None
+    try:
+        conn = _open_sqlite_readonly(db_path)
+        table, has_idx = _find_step_table(conn)
+        if not table:
+            return None
+        order_column = _quote_sqlite_identifier("idx") if has_idx else "rowid"
+        row = conn.execute(
+            "SELECT step_payload FROM " + table
+            + " WHERE step_type=? ORDER BY " + order_column + " LIMIT 1",
+            (14,),
+        ).fetchone()
+        if not row or row[0] is None:
+            return None
+        payload = row[0]
+        if isinstance(payload, memoryview):
+            payload = payload.tobytes()
+        if not isinstance(payload, bytes):
+            return None
+        for title_container in iter_length_delimited_fields(payload, 19):
+            for title_bytes in iter_length_delimited_fields(title_container, 2):
+                try:
+                    title = title_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    return None
+                title = re.sub(r"\s+", " ", title).strip()
+                return title[:80] or None
+        return None
+    except (OSError, sqlite3.Error):
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def get_title_from_brain(conversation_id):
     """
     Try to extract a title from brain artifact .md files.
@@ -976,13 +1106,14 @@ def get_title_from_brain(conversation_id):
     return None
 
 
-def resolve_title(conversation_id, existing_titles, pb_path=None):
+def resolve_title(conversation_id, existing_titles, conversation_path=None):
     """
     Determine the best title for a conversation. Priority:
       1. Existing title from database (canonical Antigravity title)
       2. Brain artifact .md heading (fallback for new/missing conversations)
-      3. Fallback: date + short UUID
-    Returns (title, source) where source is 'preserved', 'brain', or 'fallback'.
+      3. A meaningful title derived from the first prompt in a v2 database
+      4. Fallback: date + short UUID
+    Returns (title, source), with source identifying the selected title source.
     """
     # Prefer the canonical title Antigravity already has in the database
     if conversation_id in existing_titles:
@@ -993,13 +1124,25 @@ def resolve_title(conversation_id, existing_titles, pb_path=None):
     if brain_title:
         return brain_title, "brain"
 
-    conv_file = pb_path
+    conv_file = conversation_path
+    if conv_file and conv_file.lower().endswith(".db"):
+        conversation_title = extract_title_from_conversation_db(conv_file)
+        if conversation_title:
+            return conversation_title, "conversation"
+
     if not conv_file:
         for conv_dir in _ALL_CONV_DIRS:
-            p = os.path.join(conv_dir, f"{conversation_id}.pb")
-            if os.path.exists(p):
-                conv_file = p
+            for extension in (".db", ".pb"):
+                p = os.path.join(conv_dir, f"{conversation_id}{extension}")
+                if os.path.exists(p):
+                    conv_file = p
+                    break
+            if conv_file:
                 break
+        if conv_file and conv_file.lower().endswith(".db"):
+            conversation_title = extract_title_from_conversation_db(conv_file)
+            if conversation_title:
+                return conversation_title, "conversation"
     if conv_file and os.path.exists(conv_file):
         mod_time = time.strftime("%b %d", time.localtime(os.path.getmtime(conv_file)))
         return f"Conversation ({mod_time}) {conversation_id[:8]}", "fallback"
@@ -1010,7 +1153,8 @@ def resolve_title(conversation_id, existing_titles, pb_path=None):
 # ─── Protobuf Entry Builder ──────────────────────────────────────────────────
 
 def build_trajectory_entry(conversation_id, title, existing_inner_data=None,
-                           workspace_path=None, pb_mtime=None):
+                           workspace_path=None, conversation_mtime=None,
+                           source_is_db=False):
     """
     Build a single trajectory summary protobuf entry.
 
@@ -1018,8 +1162,9 @@ def build_trajectory_entry(conversation_id, title, existing_inner_data=None,
       ALL other fields (workspace, timestamps, tool state) are preserved.
     - If workspace_path is provided and there is no existing workspace,
       a workspace field (field 9) is injected.
-    - If pb_mtime is provided and timestamps are missing,
-      timestamp fields (3, 7, 10) are injected for proper sorting.
+    - Existing .db entries refresh only updated-at field 3 when the source file
+      is newer. Existing .pb entries retain their current timestamps.
+    - New entries receive timestamp fields 3, 7, and 10 from the source mtime.
     """
     if existing_inner_data:
         preserved_fields = strip_field_from_protobuf(existing_inner_data, 1)
@@ -1040,15 +1185,19 @@ def build_trajectory_entry(conversation_id, title, existing_inner_data=None,
             # Strip old workspace (field 9) and inject the new one
             inner_info = strip_field_from_protobuf(inner_info, 9)
             inner_info += build_workspace_field(workspace_path)
-        # Inject timestamps if missing
-        if pb_mtime and not has_timestamp_fields(existing_inner_data):
-            inner_info += build_timestamp_fields(pb_mtime)
+        if source_is_db and conversation_mtime:
+            indexed_mtime = extract_timestamp_seconds(existing_inner_data, 3)
+            if indexed_mtime is None or int(conversation_mtime) > indexed_mtime:
+                inner_info = strip_field_from_protobuf(inner_info, 3)
+                inner_info += build_timestamp_field(3, conversation_mtime)
+        elif conversation_mtime and not has_timestamp_fields(existing_inner_data):
+            inner_info += build_timestamp_fields(conversation_mtime)
     else:
         inner_info = encode_string_field(1, title)
         if workspace_path:
             inner_info += build_workspace_field(workspace_path)
-        if pb_mtime:
-            inner_info += build_timestamp_fields(pb_mtime)
+        if conversation_mtime:
+            inner_info += build_timestamp_fields(conversation_mtime)
 
     info_b64 = base64.b64encode(inner_info).decode('utf-8')
     sub_message = encode_string_field(1, info_b64)
@@ -1100,23 +1249,8 @@ def check_for_updates():
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-def main():
-    print()
-    print("=" * 62)
-    print(f"   Antigravity Conversation Fix  v{_CURRENT_VERSION}")
-    print("   Rebuilds your conversation index — sorted by date")
-    print("=" * 62)
-    print()
-
-    check_for_updates()
-
-    print("  IMPORTANT: Close Antigravity completely before continuing.")
-    print("  If it is open, this fix may be overwritten when the app exits.")
-    print()
-
-    # ── Check if Antigravity is running ────────────────────────────────────
-
-    _ag_running = False
+def is_antigravity_running():
+    """Return True when an Antigravity desktop process is detected."""
     if _SYSTEM == "Windows":
         for exe_name in ("antigravity.exe", "antigravity ide.exe"):
             try:
@@ -1125,12 +1259,12 @@ def main():
                     capture_output=True, text=True, creationflags=0x08000000
                 )
                 if exe_name in result.stdout.lower():
-                    _ag_running = True
-                    break
+                    return True
             except Exception:
                 pass
-    elif _IS_WSL:
-        # Check the Windows host process first, then Linux processes
+        return False
+
+    if _IS_WSL:
         for exe_name in ("antigravity.exe", "antigravity ide.exe"):
             try:
                 result = subprocess.run(
@@ -1138,42 +1272,52 @@ def main():
                     capture_output=True, text=True
                 )
                 if exe_name in result.stdout.lower():
-                    _ag_running = True
-                    break
+                    return True
             except Exception:
                 pass
-        if not _ag_running:
-            try:
-                result = subprocess.run(
-                    ['pgrep', '-f', 'antigravity'],
-                    capture_output=True, text=True
-                )
-                if result.stdout.strip():
-                    _ag_running = True
-            except Exception:
-                pass
-    else:
-        # Linux / macOS: check for antigravity process
+
+    # Exact process-name checks avoid matching this script, its repository
+    # path, or another command line that merely contains "antigravity".
+    for process_name in (
+        "antigravity", "Antigravity", "antigravity-ide",
+        "antigravity ide", "Antigravity IDE",
+    ):
         try:
             result = subprocess.run(
-                ['pgrep', '-f', 'antigravity'],
-                capture_output=True, text=True
+                ['pgrep', '-x', process_name], capture_output=True, text=True
             )
-            if result.stdout.strip():
-                _ag_running = True
+            if result.returncode == 0 and result.stdout.strip():
+                return True
         except Exception:
             pass
+    return False
 
-    if _ag_running:
-        print("  WARNING: Antigravity may still be running!")
+
+def main():
+    print()
+    print("=" * 62)
+    print(f"   Antigravity Conversation Fix  v{_CURRENT_VERSION}")
+    print("   Rebuilds your conversation index — sorted by date")
+    print("=" * 62)
+    print()
+
+    print("  IMPORTANT: Close Antigravity completely before continuing.")
+    print("  If it is open, this fix may be overwritten when the app exits.")
+    print()
+
+    # ── Check if Antigravity is running ────────────────────────────────────
+
+    # Fail closed before conversation discovery or any database write. Letting
+    # users continue here allowed the running app to overwrite a fresh index.
+    if is_antigravity_running():
+        print("  ERROR: Antigravity is still running.")
         print()
-        print("  The fix will NOT work correctly while Antigravity is open.")
+        print("  No files or databases were changed.")
         print("  Please close it first: File > Exit, or kill it.")
         print()
-        choice = input("  Press Enter to continue anyway (or type Q to quit): ")
-        if choice.strip().lower() == 'q':
-            return 1
-        print()
+        return 1
+
+    check_for_updates()
 
     # ── Validate paths ──────────────────────────────────────────────────────
 
@@ -1232,8 +1376,8 @@ def main():
     print("  " + "-" * 58)
 
     resolved = []  # (cid, title, source, inner_data, has_ws)
-    stats = {"brain": 0, "preserved": 0, "fallback": 0}
-    markers = {"brain": "+", "preserved": "~", "fallback": "?"}
+    stats = {"brain": 0, "preserved": 0, "conversation": 0, "fallback": 0}
+    markers = {"brain": "+", "preserved": "~", "conversation": "=", "fallback": "?"}
 
     for i, cid in enumerate(conversation_ids, 1):
         title, source = resolve_title(cid, existing_titles, conv_catalog.get(cid))
@@ -1246,8 +1390,11 @@ def main():
         print(f"    [{i:3d}] {marker} {title[:50]}{ws_flag}")
 
     print("  " + "-" * 58)
-    print(f"  Legend: [+] brain  [~] preserved  [?] fallback  [WS] workspace")
-    print(f"  Totals: {stats['brain']} brain, {stats['preserved']} preserved, {stats['fallback']} fallback")
+    print("  Legend: [+] brain  [~] preserved  [=] conversation  [?] fallback  [WS] workspace")
+    print(
+        f"  Totals: {stats['brain']} brain, {stats['preserved']} preserved, "
+        f"{stats['conversation']} conversation, {stats['fallback']} fallback"
+    )
     print()
 
     # ── Workspace assignment ───────────────────────────────────────────────
@@ -1308,22 +1455,35 @@ def main():
     print("  Building final index...")
     result_bytes = b""
     ws_total = 0
-    ts_injected = 0
+    ts_updated = 0
 
     for cid, title, source, inner_data, has_ws in resolved:
         ws_path = ws_assignments.get(cid)
-        pb_path = conv_catalog.get(cid)
-        pb_mtime = os.path.getmtime(pb_path) if pb_path and os.path.exists(pb_path) else None
+        conversation_path = conv_catalog.get(cid)
+        conversation_mtime = (
+            os.path.getmtime(conversation_path)
+            if conversation_path and os.path.exists(conversation_path) else None
+        )
+        source_is_db = bool(
+            conversation_path and conversation_path.lower().endswith(".db")
+        )
+        old_timestamp = extract_timestamp_seconds(inner_data, 3) if inner_data else None
 
-        entry = build_trajectory_entry(cid, title, inner_data, ws_path, pb_mtime)
+        entry = build_trajectory_entry(
+            cid, title, inner_data, ws_path, conversation_mtime, source_is_db
+        )
         result_bytes += encode_length_delimited(1, entry)
 
         if has_ws or ws_path:
             ws_total += 1
-        if pb_mtime and (not inner_data or not has_timestamp_fields(inner_data)):
-            ts_injected += 1
+        if conversation_mtime and (
+            not inner_data
+            or (source_is_db and (old_timestamp is None or int(conversation_mtime) > old_timestamp))
+            or (not source_is_db and not has_timestamp_fields(inner_data))
+        ):
+            ts_updated += 1
 
-    print(f"  Workspace: {ws_total} mapped  |  Timestamps injected: {ts_injected}")
+    print(f"  Workspace: {ws_total} mapped  |  Timestamps added/refreshed: {ts_updated}")
     print()
 
     # ── Write the rebuilt index to ALL databases ────────────────────────────
