@@ -2,7 +2,9 @@ Antigravity Conversation Fix v1.07
 
 💬 Meaningful Titles from `.db` Conversations
 
-When neither the sidebar index nor brain artifacts contain a title, the tool now derives a concise title from the first user prompt stored in a newer `.db` conversation. Existing index titles still have highest priority, followed by brain headings, then the first prompt.
+When neither the sidebar index nor a brain heading contains a title, the tool derives a concise title from the first readable user request. It prefers a useful first sentence, replaces HTTP(S) links with their hostname, and limits other prompt-derived titles to 10 words and 60 characters. Exact long raw-prompt titles written by the earlier v1.07 executable are reformatted without changing genuine Antigravity titles.
+
+Legacy `.pb` conversations can also recover titles from the first `USER_EXPLICIT` or `USER_INPUT` request in a readable brain transcript or overview. Encrypted `.pb` data without one of those readable artifacts still receives the date-and-ID fallback.
 
 🕒 Recent-Message Visibility
 
@@ -34,6 +36,7 @@ Notes
 • Automatically backs up your current index before making changes
 • Opens conversation files read-only and never modifies them
 • Preserves existing titles, created time, workspace assignments, and unknown metadata except for the targeted `.db` updated-time refresh
+• Keeps the result window open after success, an ordinary stop, or an unexpected error until Enter is pressed
 • Safe to run multiple times
 • Windows users can run the executable; macOS and Linux users can run the Python source
 

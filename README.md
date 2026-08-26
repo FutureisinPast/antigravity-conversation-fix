@@ -53,13 +53,14 @@ Antigravity stores conversation data in two places:
 
 > **Note:** The tool automatically detects all folder name variants — `antigravity`, `antigravity-ide`, `antigravity-backup`, `Antigravity`, and `Antigravity IDE` — and merges conversations from all locations. Duplicates are automatically removed (newest location wins).
 
-When the index gets corrupted, conversations still exist on disk but don't show up in the sidebar. This tool scans your conversation files, sorts them by date, pulls titles from brain artifacts or derives them from the first prompt in newer conversation databases, and writes a clean index back to the database.
+When the index gets corrupted, conversations still exist on disk but don't show up in the sidebar. This tool scans your conversation files, sorts them by date, pulls titles from brain artifacts, or creates concise titles from readable user requests, and writes a clean index back to the database.
 
 **Title resolution priority:**
-1. Titles already in the database (canonical Antigravity titles — preserved across re-runs)
+1. Titles already in the database (canonical Antigravity titles — preserved across re-runs; only the exact raw-prompt titles written by the first v1.07 build are reformatted)
 2. Brain artifact `.md` headings (for conversations not yet indexed)
-3. A meaningful title derived from the first user prompt in a `.db` conversation
-4. Fallback: `Conversation (date) short-id`
+3. A concise title derived from the first valid user prompt in a `.db` conversation
+4. For legacy `.pb` conversations, the first readable `USER_EXPLICIT` or `USER_INPUT` request in the brain transcript/overview
+5. Fallback: `Conversation (date) short-id`
 
 ## Output Legend
 
@@ -67,7 +68,7 @@ When the index gets corrupted, conversations still exist on disk but don't show 
 |---|---|
 | `[+]` | Title extracted from brain artifact |
 | `[~]` | Title preserved from existing database |
-| `[=]` | Title derived from a `.db` conversation's first user prompt |
+| `[=]` | Title derived from a conversation's readable user request |
 | `[?]` | Fallback title (no source available) |
 | `[WS]` | Workspace metadata preserved or recovered |
 
@@ -75,6 +76,10 @@ When the index gets corrupted, conversations still exist on disk but don't show 
 
 ### v1.07
 - **Fix:** **Meaningful `.db` titles** — derives a concise title from the first user prompt when neither the existing index nor brain artifacts contain a title, replacing many date-and-ID placeholders.
+- **Fix:** Prompt-derived titles now use a short first sentence when available, collapse web links to their hostname, and otherwise stop at 10 words/60 characters instead of showing a long raw request. Exact raw-prompt titles written by the earlier v1.07 executable are safely migrated on the next run.
+- **Fix:** Legacy `.pb` conversations can recover a title from readable `USER_EXPLICIT`/`USER_INPUT` brain logs. Encrypted `.pb` data without a readable transcript or overview still uses the date-and-ID fallback.
+- **Fix:** A `.db` is preferred over a `.pb` with the same ID inside one data folder, and malformed early prompt records no longer hide a later valid prompt.
+- **Fix:** The executable now waits for Enter after every normal result or unexpected error so the final status remains visible.
 - **Fix:** **Recent-message visibility** — when an existing `.db` conversation file is newer than its indexed update time, refreshes only the sidebar's updated timestamp. Created time, workspace mapping, and unknown metadata remain unchanged.
 - **Safety:** The tool now exits without scanning or writing when Antigravity is running, preventing the app from later overwriting the repaired index.
 - **Tests:** Generated SQLite/protobuf fixtures cover title extraction, malformed input, title priority, timestamp refresh, metadata preservation, and the active-process abort.
@@ -160,7 +165,7 @@ The tool automatically detects WSL, resolves your Windows `%APPDATA%` path, and 
 A: No. If Antigravity was fully closed before the repair, reopen it afterward. Reboot your PC only if the changes do not appear.
 
 **Q: Why do some titles show as "Conversation (Mar 10) abc12345"?**
-A: v1.07+ derives a meaningful title from the first user prompt in newer `.db` conversations. A placeholder remains only when no existing index title, brain heading, or usable first prompt is available.
+A: v1.07 derives a concise title from readable `.db` prompts and legacy brain logs. A placeholder remains when there is no existing title or readable artifact; an encrypted legacy `.pb` file cannot provide a title by itself.
 
 **Q: Why can recent messages disappear from the sidebar again later?**
 A: A conversation's `.db` file can be updated after the sidebar index was rebuilt. Re-run v1.07+ with Antigravity fully closed; the tool refreshes that conversation's updated time while preserving its created time and other metadata.

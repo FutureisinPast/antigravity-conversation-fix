@@ -58,7 +58,7 @@ import time
 import subprocess
 import platform
 import webbrowser
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 from urllib.request import urlopen, Request
 
 _CURRENT_VERSION = "1.07"
@@ -321,6 +321,14 @@ def _find_brain_path(conversation_id):
     return None
 
 
+def _iter_brain_paths(conversation_id):
+    """Yield every matching brain folder in configured priority order."""
+    for brain_dir in _ALL_BRAIN_DIRS:
+        path = os.path.join(brain_dir, conversation_id)
+        if os.path.isdir(path):
+            yield path
+
+
 def _collect_all_conversations():
     """
     Merge conversation files from all folders (new, old, backup).
@@ -333,17 +341,22 @@ def _collect_all_conversations():
         if not os.path.isdir(conv_dir):
             continue
         try:
-            for name in os.listdir(conv_dir):
-                # Accept .pb (legacy protobuf) and .db (new SQLite) files
-                # Skip SQLite journal files (.db-shm, .db-wal)
-                if name.endswith(".pb"):
+            # Choose within a folder first so a .db always beats a legacy .pb
+            # for the same ID. Only then merge into the global catalog, keeping
+            # the configured new > old > backup directory priority.
+            folder_catalog = {}
+            for name in sorted(os.listdir(conv_dir)):
+                lower_name = name.lower()
+                if lower_name.endswith(".db") and not lower_name.endswith((".db-shm", ".db-wal")):
                     cid = name[:-3]
-                elif name.endswith(".db") and not name.endswith((".db-shm", ".db-wal")):
+                    folder_catalog[cid] = os.path.join(conv_dir, name)
+                elif lower_name.endswith(".pb"):
                     cid = name[:-3]
-                else:
-                    continue
+                    if cid not in folder_catalog:
+                        folder_catalog[cid] = os.path.join(conv_dir, name)
+            for cid, path in folder_catalog.items():
                 if cid not in catalog:
-                    catalog[cid] = os.path.join(conv_dir, name)
+                    catalog[cid] = path
         except Exception:
             pass
     return catalog
@@ -857,6 +870,15 @@ def interactive_workspace_assignment(unmapped_entries):
 
 # ─── Metadata Extraction ─────────────────────────────────────────────────────
 
+def _is_generated_fallback_title(title, conversation_id):
+    """Return True only for this tool's exact date/ID fallback formats."""
+    short_id = re.escape(conversation_id[:8])
+    return bool(
+        re.fullmatch(r"Conversation \([A-Z][a-z]{2} \d{2}\) " + short_id, title)
+        or title == "Conversation " + conversation_id[:8]
+    )
+
+
 def extract_existing_metadata(db_path):
     """
     Read metadata already stored in the database's trajectory data.
@@ -925,7 +947,7 @@ def extract_existing_metadata(db_path):
                     _, ip = decode_varint(raw_inner, ip)
                     il, ip = decode_varint(raw_inner, ip)
                     title = raw_inner[ip:ip + il].decode('utf-8', errors='replace')
-                    if not title.startswith("Conversation (") and not title.startswith("Conversation "):
+                    if not _is_generated_fallback_title(title, uid):
                         titles[uid] = title
                 except Exception:
                     pass
@@ -1040,12 +1062,78 @@ def _find_step_table(conn):
     return None, False
 
 
-def extract_title_from_conversation_db(db_path):
-    """
-    Derive a meaningful title from the first user prompt in a v2 conversation.
+def normalize_prompt_text(prompt):
+    """Normalize prompt whitespace without otherwise rewriting its contents."""
+    if not isinstance(prompt, str):
+        return ""
+    return re.sub(r"\s+", " ", prompt).strip()
 
-    The first prompt text is protobuf field 2 nested inside field 19 of the
-    first step_type=14 payload. Conversation databases are opened read-only.
+
+def _collapse_prompt_urls(prompt):
+    """Replace HTTP(S) URLs with their hostnames, retaining sentence punctuation."""
+    def replace_url(match):
+        raw_url = match.group(0)
+        url = raw_url
+        trailing = ""
+        while url and url[-1] in ".,!?;:)]}":
+            trailing = url[-1] + trailing
+            url = url[:-1]
+        hostname = urlparse(url).hostname
+        return (hostname or url) + trailing
+
+    return re.sub(r"https?://[^\s<>()]+", replace_url, prompt, flags=re.IGNORECASE)
+
+
+def _truncate_prompt_title(text, max_chars=60, max_words=10):
+    """Return a word-boundary title within both limits, adding an ellipsis."""
+    words = text.split()
+    truncated = len(words) > max_words
+    words = words[:max_words]
+    result = ""
+    for word in words:
+        candidate = word if not result else result + " " + word
+        if len(candidate) > max_chars:
+            truncated = True
+            break
+        result = candidate
+    if not result and text:
+        result = text[:max_chars].rstrip()
+        truncated = len(text) > len(result)
+    if truncated:
+        result = result.rstrip(".,;:!?")
+        while result and len(result) + 1 > max_chars:
+            if " " in result:
+                result = result.rsplit(" ", 1)[0]
+            else:
+                result = result[:max_chars - 1].rstrip()
+                break
+        result += "…"
+    return result
+
+
+def format_prompt_title(prompt):
+    """Create a concise, deterministic title from a user prompt."""
+    normalized = normalize_prompt_text(prompt)
+    if not normalized:
+        return None
+    normalized = normalize_prompt_text(_collapse_prompt_urls(normalized))
+    normalized = re.sub(r"^#{1,6}\s+", "", normalized)
+
+    sentence_match = re.match(r"^(.+?[.!?])(?:\s|$)", normalized)
+    if sentence_match:
+        first_sentence = sentence_match.group(1).strip()
+        if len(first_sentence) <= 60 and len(first_sentence.split()) <= 10:
+            return first_sentence
+
+    return _truncate_prompt_title(normalized) or None
+
+
+def extract_prompt_from_conversation_db(db_path):
+    """
+    Read the first valid user prompt from a v2 conversation database.
+
+    Prompt text is protobuf field 2 nested inside field 19 of an ordered
+    step_type=14 payload. Conversation databases are opened read-only.
     """
     conn = None
     try:
@@ -1054,26 +1142,28 @@ def extract_title_from_conversation_db(db_path):
         if not table:
             return None
         order_column = _quote_sqlite_identifier("idx") if has_idx else "rowid"
-        row = conn.execute(
+        rows = conn.execute(
             "SELECT step_payload FROM " + table
-            + " WHERE step_type=? ORDER BY " + order_column + " LIMIT 1",
+            + " WHERE step_type=? ORDER BY " + order_column,
             (14,),
-        ).fetchone()
-        if not row or row[0] is None:
-            return None
-        payload = row[0]
-        if isinstance(payload, memoryview):
-            payload = payload.tobytes()
-        if not isinstance(payload, bytes):
-            return None
-        for title_container in iter_length_delimited_fields(payload, 19):
-            for title_bytes in iter_length_delimited_fields(title_container, 2):
-                try:
-                    title = title_bytes.decode("utf-8")
-                except UnicodeDecodeError:
-                    return None
-                title = re.sub(r"\s+", " ", title).strip()
-                return title[:80] or None
+        )
+        for row in rows:
+            if not row or row[0] is None:
+                continue
+            payload = row[0]
+            if isinstance(payload, memoryview):
+                payload = payload.tobytes()
+            if not isinstance(payload, bytes):
+                continue
+            for title_container in iter_length_delimited_fields(payload, 19):
+                for title_bytes in iter_length_delimited_fields(title_container, 2):
+                    try:
+                        prompt = title_bytes.decode("utf-8")
+                    except UnicodeDecodeError:
+                        continue
+                    prompt = normalize_prompt_text(prompt)
+                    if prompt:
+                        return prompt
         return None
     except (OSError, sqlite3.Error):
         return None
@@ -1082,26 +1172,174 @@ def extract_title_from_conversation_db(db_path):
             conn.close()
 
 
+def extract_title_from_conversation_db(db_path):
+    """Derive a concise title from the first valid v2 user prompt."""
+    return format_prompt_title(extract_prompt_from_conversation_db(db_path))
+
+
+_USER_REQUEST_TYPES = {"USER_EXPLICIT", "USER_INPUT"}
+_REQUEST_TYPE_KEYS = (
+    "type", "request_type", "message_type", "event_type", "kind", "role",
+)
+_REQUEST_TEXT_KEYS = ("text", "content", "message", "request", "prompt", "input", "query")
+_REQUEST_CONTAINER_KEYS = ("data", "payload", "event", "details")
+
+
+def _unwrap_user_request_text(value):
+    """Remove Antigravity's request envelope while tolerating truncated logs."""
+    if not isinstance(value, str):
+        return ""
+    opening = "<USER_REQUEST>"
+    start = value.find(opening)
+    if start >= 0:
+        value = value[start + len(opening):]
+        end_positions = [
+            value.find(marker)
+            for marker in (
+                "</USER_REQUEST>",
+                "<ADDITIONAL_METADATA>",
+                "<USER_SETTINGS_CHANGE>",
+                "<truncated",
+            )
+            if value.find(marker) >= 0
+        ]
+        if end_positions:
+            value = value[:min(end_positions)]
+    return normalize_prompt_text(value)
+
+
+def _text_from_request_value(value):
+    """Extract text from common transcript content shapes."""
+    if isinstance(value, str):
+        return _unwrap_user_request_text(value)
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            text = _text_from_request_value(item)
+            if text:
+                parts.append(text)
+        return normalize_prompt_text(" ".join(parts))
+    if isinstance(value, dict):
+        for key in _REQUEST_TEXT_KEYS:
+            if key in value:
+                text = _text_from_request_value(value[key])
+                if text:
+                    return text
+    return ""
+
+
+def _request_text_from_json(node):
+    """Find the first explicitly tagged user request in a JSON value."""
+    if isinstance(node, dict):
+        request_type = None
+        for key in _REQUEST_TYPE_KEYS:
+            value = node.get(key)
+            if isinstance(value, str) and value.upper() in _USER_REQUEST_TYPES:
+                request_type = value.upper()
+                break
+        if request_type:
+            for key in _REQUEST_TEXT_KEYS + _REQUEST_CONTAINER_KEYS:
+                if key in node:
+                    text = _text_from_request_value(node[key])
+                    if text and text.upper() not in _USER_REQUEST_TYPES:
+                        return text
+        for value in node.values():
+            text = _request_text_from_json(value)
+            if text:
+                return text
+    elif isinstance(node, list):
+        for value in node:
+            text = _request_text_from_json(value)
+            if text:
+                return text
+    return None
+
+
+def _extract_request_from_log(log_path):
+    """Read a transcript/overview line by line and return its first user request."""
+    marker_pattern = re.compile(r"\b(?:USER_EXPLICIT|USER_INPUT)\b", re.IGNORECASE)
+    waiting_for_text = False
+    is_jsonl = log_path.lower().endswith(".jsonl")
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as log_file:
+            for raw_line in log_file:
+                line = raw_line.strip()
+                if not line:
+                    continue
+
+                try:
+                    parsed = json.loads(line)
+                except (TypeError, ValueError):
+                    parsed = None
+                if parsed is not None:
+                    text = _request_text_from_json(parsed)
+                    if text:
+                        return text
+                elif is_jsonl:
+                    # A partially written JSONL record must not be mistaken for
+                    # plaintext. Skip it and keep scanning later complete rows.
+                    continue
+
+                marker = marker_pattern.search(line)
+                if marker:
+                    tail = line[marker.end():].lstrip(" \t:=-|]})\"")
+                    tail = tail.rstrip(" \t,\"")
+                    if tail:
+                        return normalize_prompt_text(tail)
+                    waiting_for_text = True
+                    continue
+
+                if waiting_for_text:
+                    key_value = re.match(
+                        r"^(?:text|content|message|request|prompt|input|query)\s*[:=]\s*(.+)$",
+                        line,
+                        flags=re.IGNORECASE,
+                    )
+                    candidate = key_value.group(1) if key_value else line
+                    candidate = candidate.strip(" \t,\"")
+                    candidate = normalize_prompt_text(candidate)
+                    if candidate:
+                        return candidate
+    except OSError:
+        return None
+    return None
+
+
+def get_title_from_brain_request(conversation_id):
+    """Recover a legacy title from the first readable user request artifact."""
+    for brain_path in _iter_brain_paths(conversation_id):
+        logs_path = os.path.join(brain_path, ".system_generated", "logs")
+        for filename in ("transcript.jsonl", "overview.txt"):
+            log_path = os.path.join(logs_path, filename)
+            if not os.path.isfile(log_path):
+                continue
+            prompt = _extract_request_from_log(log_path)
+            title = format_prompt_title(prompt)
+            if title:
+                return title
+    return None
+
+
 def get_title_from_brain(conversation_id):
     """
     Try to extract a title from brain artifact .md files.
     Returns the first markdown heading found, or None.
     """
-    brain_path = _find_brain_path(conversation_id)
-    if not brain_path:
-        return None
-
-    for item in sorted(os.listdir(brain_path)):
-        if item.startswith('.') or not item.endswith('.md'):
-            continue
-        try:
-            filepath = os.path.join(brain_path, item)
-            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-                first_line = f.readline().strip()
-            if first_line.startswith('#'):
-                return first_line.lstrip('# ').strip()[:80]
-        except Exception:
-            pass
+    for brain_path in _iter_brain_paths(conversation_id):
+        for item in sorted(os.listdir(brain_path)):
+            if item.startswith('.') or not item.endswith('.md'):
+                continue
+            try:
+                filepath = os.path.join(brain_path, item)
+                with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                    for line_number, line in enumerate(f):
+                        if line_number >= 100:
+                            break
+                        heading = line.strip()
+                        if heading.startswith('#'):
+                            return heading.lstrip('# ').strip()[:80]
+            except Exception:
+                pass
 
     return None
 
@@ -1109,40 +1347,53 @@ def get_title_from_brain(conversation_id):
 def resolve_title(conversation_id, existing_titles, conversation_path=None):
     """
     Determine the best title for a conversation. Priority:
-      1. Existing title from database (canonical Antigravity title)
+      1. Existing title from database (canonical Antigravity title), unless it
+         exactly matches the raw title written by the earlier v1.07 build
       2. Brain artifact .md heading (fallback for new/missing conversations)
-      3. A meaningful title derived from the first prompt in a v2 database
+      3. A concise title derived from a v2 prompt or readable legacy log
       4. Fallback: date + short UUID
     Returns (title, source), with source identifying the selected title source.
     """
-    # Prefer the canonical title Antigravity already has in the database
-    if conversation_id in existing_titles:
-        return existing_titles[conversation_id], "preserved"
+    conv_file = conversation_path
+    if not conv_file:
+        for conv_dir in _ALL_CONV_DIRS:
+            db_path = os.path.join(conv_dir, f"{conversation_id}.db")
+            pb_path = os.path.join(conv_dir, f"{conversation_id}.pb")
+            if os.path.exists(db_path):
+                conv_file = db_path
+                break
+            if os.path.exists(pb_path):
+                conv_file = pb_path
+                break
+
+    db_prompt = None
+    if conv_file and conv_file.lower().endswith(".db"):
+        db_prompt = extract_prompt_from_conversation_db(conv_file)
+
+    # Preserve canonical Antigravity titles. The sole migration exception is
+    # the exact normalized-prompt[:80] value written by the first v1.07 build.
+    existing_title = existing_titles.get(conversation_id)
+    if existing_title is not None:
+        old_v107_title = db_prompt[:80] if db_prompt else None
+        if old_v107_title is not None and existing_title == old_v107_title:
+            migrated_title = format_prompt_title(db_prompt)
+            if migrated_title and migrated_title != existing_title:
+                return migrated_title, "conversation"
+        return existing_title, "preserved"
 
     # Fall back to brain artifact heading for conversations not yet indexed
     brain_title = get_title_from_brain(conversation_id)
     if brain_title:
         return brain_title, "brain"
 
-    conv_file = conversation_path
-    if conv_file and conv_file.lower().endswith(".db"):
-        conversation_title = extract_title_from_conversation_db(conv_file)
+    if db_prompt:
+        conversation_title = format_prompt_title(db_prompt)
         if conversation_title:
             return conversation_title, "conversation"
-
-    if not conv_file:
-        for conv_dir in _ALL_CONV_DIRS:
-            for extension in (".db", ".pb"):
-                p = os.path.join(conv_dir, f"{conversation_id}{extension}")
-                if os.path.exists(p):
-                    conv_file = p
-                    break
-            if conv_file:
-                break
-        if conv_file and conv_file.lower().endswith(".db"):
-            conversation_title = extract_title_from_conversation_db(conv_file)
-            if conversation_title:
-                return conversation_title, "conversation"
+    if conv_file and conv_file.lower().endswith(".pb"):
+        conversation_title = get_title_from_brain_request(conversation_id)
+        if conversation_title:
+            return conversation_title, "conversation"
     if conv_file and os.path.exists(conv_file):
         mod_time = time.strftime("%b %d", time.localtime(os.path.getmtime(conv_file)))
         return f"Conversation ({mod_time}) {conversation_id[:8]}", "fallback"
@@ -1327,7 +1578,6 @@ def main():
             print(f"    {candidate}")
         print()
         print("  Make sure Antigravity has been installed and opened at least once.")
-        input("\n  Press Enter to close...")
         return 1
 
     # ── Discover conversations (multi-folder merge with dedup) ───────────
@@ -1336,7 +1586,6 @@ def main():
 
     if not conv_catalog:
         print("  No conversations found on disk. Nothing to fix.")
-        input("\n  Press Enter to close...")
         return 0
 
     # Sort by modification time (newest first)
@@ -1524,9 +1773,24 @@ def main():
         print(f"    {_backup_dir()}")
         print("  Keep those .txt files if you may want to undo this.")
         print()
-    input("  Press Enter to close...")
     return 0
 
 
+def run_cli():
+    """Run the interactive command and always leave its result visible."""
+    try:
+        return main()
+    except Exception as error:
+        print()
+        print("  UNEXPECTED ERROR: " + str(error))
+        print("  The repair did not complete. Check any backup path shown above.")
+        return 1
+    finally:
+        try:
+            input("\n  Finished. Press Enter to close...")
+        except (EOFError, OSError, KeyboardInterrupt):
+            pass
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_cli())
