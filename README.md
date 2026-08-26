@@ -164,6 +164,10 @@ A: Yes! v1.04+ fully supports `vscode-remote://` URIs. v1.05+ also supports runn
 **Q: I updated Antigravity and the folder changed from "Antigravity" to "Antigravity IDE". Will the tool still work?**
 A: Yes! v1.05+ automatically detects both folder names and uses whichever one exists on your system.
 
+## Related Ecosystem Tools
+
+- **[Antigravity Context Meter](https://github.com/Dunphil692/antigravity-context-meter)**: Prevent conversation degradation and memory loss before it happens with real-time context token telemetry and 1-click zero-loss session migration prompt distillation.
+
 ## License
 
 MIT — free to use, share, and modify.
