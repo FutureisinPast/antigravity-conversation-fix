@@ -50,6 +50,7 @@ if sys.version_info < (3, 7):
     )
     sys.exit(1)
 
+import argparse
 import sqlite3
 import base64
 import json
@@ -67,11 +68,12 @@ _RELEASES_URL = f"https://github.com/{_GITHUB_REPO}/releases/latest"
 
 # ─── Path Detection ──────────────────────────────────────────────────────────
 # Antigravity was renamed to "Antigravity IDE" in a recent update.
-# We check the new name first, then fall back to the old name so the tool
-# works on both old and new installations.
+# We check all known variants (both casing and naming) across Windows, Linux,
+# WSL, and macOS to guarantee full compatibility.
 
 _SYSTEM = platform.system()
-_ANTIGRAVITY_NAMES = ("Antigravity IDE", "antigravity", "Antigravity")
+_ANTIGRAVITY_NAMES = ("Antigravity IDE", "antigravity", "Antigravity", "antigravity-ide")
+_GEMINI_FOLDER_NAMES = ("antigravity-ide", "antigravity", "antigravity-backup", "Antigravity IDE", "Antigravity")
 
 
 def _is_wsl():
@@ -136,17 +138,69 @@ def _get_wsl_windows_appdata():
     return None
 
 
+def _get_wsl_windows_userprofile():
+    """
+    Resolve the Windows %USERPROFILE% path from inside WSL.
+    Returns a WSL-accessible path string, or None if resolution fails.
+    """
+    # Strategy 1: cmd.exe %USERPROFILE% → wslpath
+    try:
+        proc = subprocess.run(
+            ['cmd.exe', '/c', 'echo %USERPROFILE%'],
+            capture_output=True, text=True, check=True
+        )
+        win_path = proc.stdout.strip()
+        if win_path and win_path != "%USERPROFILE%":
+            proc_wsl = subprocess.run(
+                ['wslpath', win_path],
+                capture_output=True, text=True, check=True
+            )
+            wsl_path = proc_wsl.stdout.strip()
+            if os.path.exists(wsl_path):
+                return wsl_path
+    except Exception:
+        pass
+
+    # Strategy 2: Derive from _get_wsl_windows_appdata()
+    appdata = _get_wsl_windows_appdata()
+    if appdata:
+        profile = os.path.dirname(os.path.dirname(appdata))
+        if os.path.exists(profile):
+            return profile
+
+    # Strategy 3: Scan /mnt/c/Users/ for user folders that have .gemini
+    if os.path.exists("/mnt/c/Users"):
+        _skip = {"Default", "Default User", "All Users", "desktop.ini", "Public"}
+        try:
+            for user in os.listdir("/mnt/c/Users"):
+                if user in _skip:
+                    continue
+                user_path = os.path.join("/mnt/c/Users", user)
+                if os.path.isdir(os.path.join(user_path, ".gemini")):
+                    return user_path
+        except Exception:
+            pass
+
+    return None
+
+
 def _first_existing(*candidates):
     """Return the first path that exists on disk, or the first candidate if none exist."""
     for p in candidates:
-        if os.path.exists(p):
+        if p and os.path.exists(p):
             return p
-    return candidates[0]
+    return candidates[0] if candidates else ""
 
 
 def _existing_paths(*candidates):
-    """Return all candidate paths that exist on disk, preserving order."""
-    return [p for p in candidates if p and os.path.exists(p)]
+    """Return all candidate paths that exist on disk, preserving order and deduplicating."""
+    seen = set()
+    result = []
+    for p in candidates:
+        if p and os.path.exists(p) and p not in seen:
+            seen.add(p)
+            result.append(p)
+    return result
 
 
 if _SYSTEM == "Windows":
@@ -154,144 +208,144 @@ if _SYSTEM == "Windows":
     _profile = os.path.expandvars(r"%USERPROFILE%")
     _gemini = os.path.join(_profile, ".gemini")
 
-    _DB_CANDIDATES = (
-        os.path.join(_appdata, "Antigravity IDE", "User", "globalStorage", "state.vscdb"),
-        os.path.join(_appdata, "antigravity", "User", "globalStorage", "state.vscdb"),
-        os.path.join(_appdata, "Antigravity", "User", "globalStorage", "state.vscdb"),
+    _DB_CANDIDATES = tuple(
+        os.path.join(_appdata, name, "User", "globalStorage", "state.vscdb")
+        for name in _ANTIGRAVITY_NAMES
     )
     DB_PATH = _first_existing(*_DB_CANDIDATES)
     CONVERSATIONS_DIR = _first_existing(
-        os.path.join(_gemini, "antigravity-ide", "conversations"),
-        os.path.join(_gemini, "antigravity", "conversations"),
+        *(os.path.join(_gemini, name, "conversations") for name in _GEMINI_FOLDER_NAMES)
     )
     BRAIN_DIR = _first_existing(
-        os.path.join(_gemini, "antigravity-ide", "brain"),
-        os.path.join(_gemini, "antigravity", "brain"),
+        *(os.path.join(_gemini, name, "brain") for name in _GEMINI_FOLDER_NAMES)
     )
-    WORKSPACE_STORAGE_DIR = _first_existing(
-        os.path.join(_appdata, "Antigravity IDE", "User", "workspaceStorage"),
-        os.path.join(_appdata, "antigravity", "User", "workspaceStorage"),
-    )
+    _ws_candidates = [
+        os.path.join(_appdata, name, "User", "workspaceStorage")
+        for name in _ANTIGRAVITY_NAMES
+    ]
+    WORKSPACE_STORAGE_DIR = _first_existing(*_ws_candidates)
+    _ALL_WORKSPACE_STORAGE_DIRS = _ws_candidates
     _ALL_CONV_DIRS = [
-        os.path.join(_gemini, "antigravity-ide", "conversations"),
-        os.path.join(_gemini, "antigravity", "conversations"),
-        os.path.join(_gemini, "antigravity-backup", "conversations"),
+        os.path.join(_gemini, name, "conversations") for name in _GEMINI_FOLDER_NAMES
     ]
     _ALL_BRAIN_DIRS = [
-        os.path.join(_gemini, "antigravity-ide", "brain"),
-        os.path.join(_gemini, "antigravity", "brain"),
-        os.path.join(_gemini, "antigravity-backup", "brain"),
+        os.path.join(_gemini, name, "brain") for name in _GEMINI_FOLDER_NAMES
     ]
 elif _IS_WSL:
     _wsl_appdata = _get_wsl_windows_appdata()
+    _wsl_userprofile = _get_wsl_windows_userprofile()
     _home = os.path.expanduser("~")
+    _config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(_home, ".config")
 
+    _db_candidates_list = []
+    _ws_storage_candidates_list = []
+
+    # Windows side candidates (if resolved via WSL)
     if _wsl_appdata:
-        _DB_CANDIDATES = (
-            os.path.join(_wsl_appdata, "Antigravity IDE", "User", "globalStorage", "state.vscdb"),
-            os.path.join(_wsl_appdata, "antigravity", "User", "globalStorage", "state.vscdb"),
-            os.path.join(_wsl_appdata, "Antigravity", "User", "globalStorage", "state.vscdb"),
-        )
-        DB_PATH = _first_existing(*_DB_CANDIDATES)
-        WORKSPACE_STORAGE_DIR = _first_existing(
-            os.path.join(_wsl_appdata, "Antigravity IDE", "User", "workspaceStorage"),
-            os.path.join(_wsl_appdata, "antigravity", "User", "workspaceStorage"),
-            os.path.join(_wsl_appdata, "Antigravity", "User", "workspaceStorage"),
-        )
-    else:
-        _DB_CANDIDATES = ()
-        DB_PATH = ""
-        WORKSPACE_STORAGE_DIR = ""
+        for name in _ANTIGRAVITY_NAMES:
+            _db_candidates_list.append(
+                os.path.join(_wsl_appdata, name, "User", "globalStorage", "state.vscdb")
+            )
+            _ws_storage_candidates_list.append(
+                os.path.join(_wsl_appdata, name, "User", "workspaceStorage")
+            )
 
-    CONVERSATIONS_DIR = _first_existing(
-        os.path.join(_home, ".gemini", "antigravity-ide", "conversations"),
-        os.path.join(_home, ".gemini", "antigravity", "conversations"),
-    )
-    BRAIN_DIR = _first_existing(
-        os.path.join(_home, ".gemini", "antigravity-ide", "brain"),
-        os.path.join(_home, ".gemini", "antigravity", "brain"),
-    )
-    _gemini_wsl = os.path.join(_home, ".gemini")
-    _ALL_CONV_DIRS = [
-        os.path.join(_gemini_wsl, "antigravity-ide", "conversations"),
-        os.path.join(_gemini_wsl, "antigravity", "conversations"),
-        os.path.join(_gemini_wsl, "antigravity-backup", "conversations"),
-    ]
-    _ALL_BRAIN_DIRS = [
-        os.path.join(_gemini_wsl, "antigravity-ide", "brain"),
-        os.path.join(_gemini_wsl, "antigravity", "brain"),
-        os.path.join(_gemini_wsl, "antigravity-backup", "brain"),
-    ]
+    # Linux side candidates in WSL
+    for name in _ANTIGRAVITY_NAMES:
+        _db_candidates_list.append(
+            os.path.join(_config, name, "User", "globalStorage", "state.vscdb")
+        )
+        _ws_storage_candidates_list.append(
+            os.path.join(_config, name, "User", "workspaceStorage")
+        )
+
+    _DB_CANDIDATES = tuple(_db_candidates_list)
+    DB_PATH = _first_existing(*_DB_CANDIDATES) if _DB_CANDIDATES else ""
+    WORKSPACE_STORAGE_DIR = _first_existing(*_ws_storage_candidates_list) if _ws_storage_candidates_list else ""
+    _ALL_WORKSPACE_STORAGE_DIRS = _ws_storage_candidates_list
+
+    _conv_dirs_list = []
+    _brain_dirs_list = []
+
+    # Linux side conversations and brain
+    for name in _GEMINI_FOLDER_NAMES:
+        _conv_dirs_list.append(os.path.join(_home, ".gemini", name, "conversations"))
+        _brain_dirs_list.append(os.path.join(_home, ".gemini", name, "brain"))
+
+    # Windows side conversations and brain (if user profile found in WSL)
+    if _wsl_userprofile:
+        for name in _GEMINI_FOLDER_NAMES:
+            _conv_dirs_list.append(os.path.join(_wsl_userprofile, ".gemini", name, "conversations"))
+            _brain_dirs_list.append(os.path.join(_wsl_userprofile, ".gemini", name, "brain"))
+
+    CONVERSATIONS_DIR = _first_existing(*_conv_dirs_list)
+    BRAIN_DIR = _first_existing(*_brain_dirs_list)
+    _ALL_CONV_DIRS = _conv_dirs_list
+    _ALL_BRAIN_DIRS = _brain_dirs_list
 elif _SYSTEM == "Darwin":  # macOS
     _home = os.path.expanduser("~")
     _support = os.path.join(_home, "Library", "Application Support")
 
-    _DB_CANDIDATES = (
-        os.path.join(_support, "Antigravity IDE", "User", "globalStorage", "state.vscdb"),
-        os.path.join(_support, "antigravity", "User", "globalStorage", "state.vscdb"),
+    _DB_CANDIDATES = tuple(
+        os.path.join(_support, name, "User", "globalStorage", "state.vscdb")
+        for name in _ANTIGRAVITY_NAMES
     )
     DB_PATH = _first_existing(*_DB_CANDIDATES)
     CONVERSATIONS_DIR = _first_existing(
-        os.path.join(_home, ".gemini", "antigravity-ide", "conversations"),
-        os.path.join(_home, ".gemini", "antigravity", "conversations"),
+        *(os.path.join(_home, ".gemini", name, "conversations") for name in _GEMINI_FOLDER_NAMES)
     )
     BRAIN_DIR = _first_existing(
-        os.path.join(_home, ".gemini", "antigravity-ide", "brain"),
-        os.path.join(_home, ".gemini", "antigravity", "brain"),
+        *(os.path.join(_home, ".gemini", name, "brain") for name in _GEMINI_FOLDER_NAMES)
     )
-    WORKSPACE_STORAGE_DIR = _first_existing(
-        os.path.join(_support, "Antigravity IDE", "User", "workspaceStorage"),
-        os.path.join(_support, "antigravity", "User", "workspaceStorage"),
-    )
+    _ws_candidates = [
+        os.path.join(_support, name, "User", "workspaceStorage")
+        for name in _ANTIGRAVITY_NAMES
+    ]
+    WORKSPACE_STORAGE_DIR = _first_existing(*_ws_candidates)
+    _ALL_WORKSPACE_STORAGE_DIRS = _ws_candidates
     _gemini_mac = os.path.join(_home, ".gemini")
     _ALL_CONV_DIRS = [
-        os.path.join(_gemini_mac, "antigravity-ide", "conversations"),
-        os.path.join(_gemini_mac, "antigravity", "conversations"),
-        os.path.join(_gemini_mac, "antigravity-backup", "conversations"),
+        os.path.join(_gemini_mac, name, "conversations") for name in _GEMINI_FOLDER_NAMES
     ]
     _ALL_BRAIN_DIRS = [
-        os.path.join(_gemini_mac, "antigravity-ide", "brain"),
-        os.path.join(_gemini_mac, "antigravity", "brain"),
-        os.path.join(_gemini_mac, "antigravity-backup", "brain"),
+        os.path.join(_gemini_mac, name, "brain") for name in _GEMINI_FOLDER_NAMES
     ]
 else:  # Linux and other POSIX systems
     _home = os.path.expanduser("~")
-    _config = os.path.join(_home, ".config")
+    _config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(_home, ".config")
 
-    _DB_CANDIDATES = (
-        os.path.join(_config, "Antigravity IDE", "User", "globalStorage", "state.vscdb"),
-        os.path.join(_config, "Antigravity", "User", "globalStorage", "state.vscdb"),
-    )
+    _db_candidates_list = [
+        os.path.join(_config, name, "User", "globalStorage", "state.vscdb")
+        for name in _ANTIGRAVITY_NAMES
+    ]
+    _ws_candidates = [
+        os.path.join(_config, name, "User", "workspaceStorage")
+        for name in _ANTIGRAVITY_NAMES
+    ]
+
+    _DB_CANDIDATES = tuple(_db_candidates_list)
     DB_PATH = _first_existing(*_DB_CANDIDATES)
-    CONVERSATIONS_DIR = _first_existing(
-        os.path.join(_home, ".gemini", "antigravity-ide", "conversations"),
-        os.path.join(_home, ".gemini", "antigravity", "conversations"),
-    )
-    BRAIN_DIR = _first_existing(
-        os.path.join(_home, ".gemini", "antigravity-ide", "brain"),
-        os.path.join(_home, ".gemini", "antigravity", "brain"),
-    )
-    WORKSPACE_STORAGE_DIR = _first_existing(
-        os.path.join(_config, "Antigravity IDE", "User", "workspaceStorage"),
-        os.path.join(_config, "Antigravity", "User", "workspaceStorage"),
-    )
-    _gemini_linux = os.path.join(_home, ".gemini")
-    _ALL_CONV_DIRS = [
-        os.path.join(_gemini_linux, "antigravity-ide", "conversations"),
-        os.path.join(_gemini_linux, "antigravity", "conversations"),
-        os.path.join(_gemini_linux, "antigravity-backup", "conversations"),
+    WORKSPACE_STORAGE_DIR = _first_existing(*_ws_candidates)
+    _ALL_WORKSPACE_STORAGE_DIRS = _ws_candidates
+
+    _conv_dirs_list = [
+        os.path.join(_home, ".gemini", name, "conversations")
+        for name in _GEMINI_FOLDER_NAMES
     ]
-    _ALL_BRAIN_DIRS = [
-        os.path.join(_gemini_linux, "antigravity-ide", "brain"),
-        os.path.join(_gemini_linux, "antigravity", "brain"),
-        os.path.join(_gemini_linux, "antigravity-backup", "brain"),
+    _brain_dirs_list = [
+        os.path.join(_home, ".gemini", name, "brain")
+        for name in _GEMINI_FOLDER_NAMES
     ]
+    CONVERSATIONS_DIR = _first_existing(*_conv_dirs_list)
+    BRAIN_DIR = _first_existing(*_brain_dirs_list)
+    _ALL_CONV_DIRS = _conv_dirs_list
+    _ALL_BRAIN_DIRS = _brain_dirs_list
 
 DB_PATHS = _existing_paths(*_DB_CANDIDATES)
 BACKUP_FILENAME = "trajectorySummaries_backup.txt"
 
 
-def _backup_dir():
+def _backup_dir(custom_dir=None):
     """
     Folder where rollback backups are written.
 
@@ -302,6 +356,14 @@ def _backup_dir():
     Falls back to the current working directory if that folder is not
     writable (e.g. exe launched from a read-only location).
     """
+    if custom_dir:
+        try:
+            os.makedirs(custom_dir, exist_ok=True)
+            if os.access(custom_dir, os.W_OK):
+                return custom_dir
+        except Exception:
+            pass
+
     if getattr(sys, "frozen", False):
         base = os.path.dirname(os.path.abspath(sys.executable))
     else:
@@ -329,7 +391,7 @@ def _iter_brain_paths(conversation_id):
             yield path
 
 
-def _collect_all_conversations():
+def _collect_all_conversations(conv_dirs=None):
     """
     Merge conversation files from all folders (new, old, backup).
     Supports both .pb (protobuf, legacy) and .db (SQLite, v2.x+) formats.
@@ -337,7 +399,8 @@ def _collect_all_conversations():
     Returns dict: {conversation_id: full_file_path}
     """
     catalog = {}
-    for conv_dir in _ALL_CONV_DIRS:
+    dirs_to_scan = conv_dirs if conv_dirs is not None else _ALL_CONV_DIRS
+    for conv_dir in dirs_to_scan:
         if not os.path.isdir(conv_dir):
             continue
         try:
@@ -560,29 +623,40 @@ def extract_workspace_hint(inner_blob):
     return None
 
 
-def load_known_workspace_uris():
+def load_known_workspace_uris(storage_dirs=None):
     """
     Load all known workspace URIs from Antigravity's workspaceStorage.
     Each subfolder contains a workspace.json with a 'folder' or 'workspace' URI.
     Returns a list of URI strings sorted longest-first for prefix matching.
     """
     uris = []
-    if not os.path.isdir(WORKSPACE_STORAGE_DIR):
-        return uris
-    try:
-        for name in os.listdir(WORKSPACE_STORAGE_DIR):
-            ws_json = os.path.join(WORKSPACE_STORAGE_DIR, name, "workspace.json")
-            if os.path.exists(ws_json):
-                try:
-                    with open(ws_json, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                    uri = data.get("folder") or data.get("workspace")
-                    if uri:
-                        uris.append(uri)
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    seen = set()
+    dirs_to_scan = []
+    if storage_dirs:
+        dirs_to_scan = list(storage_dirs)
+    elif "_ALL_WORKSPACE_STORAGE_DIRS" in globals() and _ALL_WORKSPACE_STORAGE_DIRS:
+        dirs_to_scan = _existing_paths(*_ALL_WORKSPACE_STORAGE_DIRS)
+    elif WORKSPACE_STORAGE_DIR and os.path.isdir(WORKSPACE_STORAGE_DIR):
+        dirs_to_scan = [WORKSPACE_STORAGE_DIR]
+
+    for storage_dir in dirs_to_scan:
+        if not storage_dir or not os.path.isdir(storage_dir):
+            continue
+        try:
+            for name in os.listdir(storage_dir):
+                ws_json = os.path.join(storage_dir, name, "workspace.json")
+                if os.path.exists(ws_json):
+                    try:
+                        with open(ws_json, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        uri = data.get("folder") or data.get("workspace")
+                        if uri and uri not in seen:
+                            seen.add(uri)
+                            uris.append(uri)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     # Sort longest first so more-specific paths match before parent paths
     uris.sort(key=len, reverse=True)
     return uris
@@ -1544,11 +1618,89 @@ def is_antigravity_running():
     return False
 
 
-def main():
+def parse_args(argv=None):
+    """Parse command-line arguments for rebuild_conversations."""
+    parser = argparse.ArgumentParser(
+        prog="rebuild_conversations.py",
+        description="Rebuilds the Antigravity conversation index so all chat history appears correctly sorted by date.",
+    )
+    parser.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="Force rebuild even if Antigravity is running (use with caution; reopen app afterward)",
+    )
+    parser.add_argument(
+        "-n", "--dry-run",
+        action="store_true",
+        help="Simulate the rebuild and show resolved titles/workspaces without modifying databases",
+    )
+    parser.add_argument(
+        "-y", "--yes", "--auto",
+        dest="auto",
+        action="store_true",
+        help="Auto-assign detected workspaces from brain artifacts without interactive prompts",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Do not pause for user input on finish (ideal for automated scripts and headless runs)",
+    )
+    parser.add_argument(
+        "--no-update-check",
+        action="store_true",
+        help="Skip checking GitHub for newer releases",
+    )
+    parser.add_argument(
+        "--db",
+        dest="custom_dbs",
+        action="append",
+        help="Explicit path to Antigravity state.vscdb (can be specified multiple times)",
+    )
+    parser.add_argument(
+        "--conv-dir",
+        dest="custom_conv_dirs",
+        action="append",
+        help="Explicit conversation directory to scan (can be specified multiple times)",
+    )
+    parser.add_argument(
+        "--brain-dir",
+        dest="custom_brain_dirs",
+        action="append",
+        help="Explicit brain directory to scan (can be specified multiple times)",
+    )
+    parser.add_argument(
+        "--backup-dir",
+        dest="custom_backup_dir",
+        help="Directory to save rollback backups",
+    )
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"Antigravity Conversation Fix v{_CURRENT_VERSION}",
+    )
+    return parser.parse_args(argv)
+
+
+def main(opts=None):
+    if opts is None:
+        opts = argparse.Namespace(
+            force=False,
+            dry_run=False,
+            auto=False,
+            non_interactive=False,
+            no_update_check=False,
+            custom_dbs=None,
+            custom_conv_dirs=None,
+            custom_brain_dirs=None,
+            custom_backup_dir=None,
+        )
+
     print()
     print("=" * 62)
     print(f"   Antigravity Conversation Fix  v{_CURRENT_VERSION}")
     print("   Rebuilds your conversation index — sorted by date")
+    if getattr(opts, "dry_run", False):
+        print("   >>> DRY RUN MODE - No database changes will be made <<<")
     print("=" * 62)
     print()
 
@@ -1557,22 +1709,32 @@ def main():
     print()
 
     # ── Check if Antigravity is running ────────────────────────────────────
+    is_running = is_antigravity_running()
+    if is_running:
+        if getattr(opts, "force", False):
+            print("  WARNING: Antigravity is currently running, but --force was given.")
+            print("  Proceeding anyway. Ensure you restart Antigravity afterward.")
+            print()
+        else:
+            print("  ERROR: Antigravity is still running.")
+            print()
+            print("  No files or databases were changed.")
+            print("  Please close it first: File > Exit, or kill it.")
+            print("  (Pass --force / -f to override this check if necessary.)")
+            print()
+            return 1
 
-    # Fail closed before conversation discovery or any database write. Letting
-    # users continue here allowed the running app to overwrite a fresh index.
-    if is_antigravity_running():
-        print("  ERROR: Antigravity is still running.")
-        print()
-        print("  No files or databases were changed.")
-        print("  Please close it first: File > Exit, or kill it.")
-        print()
-        return 1
-
-    check_for_updates()
+    if not getattr(opts, "no_update_check", False):
+        check_for_updates()
 
     # ── Validate paths ──────────────────────────────────────────────────────
+    active_db_paths = (
+        _existing_paths(*opts.custom_dbs)
+        if getattr(opts, "custom_dbs", None)
+        else DB_PATHS
+    )
 
-    if not DB_PATHS:
+    if not active_db_paths and not getattr(opts, "dry_run", False):
         print(f"  ERROR: Database not found at any known Antigravity location:")
         for candidate in _DB_CANDIDATES:
             print(f"    {candidate}")
@@ -1581,8 +1743,12 @@ def main():
         return 1
 
     # ── Discover conversations (multi-folder merge with dedup) ───────────
-
-    conv_catalog = _collect_all_conversations()
+    active_conv_dirs = (
+        opts.custom_conv_dirs
+        if getattr(opts, "custom_conv_dirs", None)
+        else _ALL_CONV_DIRS
+    )
+    conv_catalog = _collect_all_conversations(active_conv_dirs)
 
     if not conv_catalog:
         print("  No conversations found on disk. Nothing to fix.")
@@ -1602,17 +1768,16 @@ def main():
         dir_counts[parent] = dir_counts.get(parent, 0) + 1
     for d, c in dir_counts.items():
         folder_name = os.path.basename(os.path.dirname(d))  # antigravity-ide, antigravity, etc.
-        print(f"    {folder_name}: {c} conversation(s)")
+        print(f"    {folder_name} ({d}): {c} conversation(s)")
     print(f"  Found {len(conversation_ids)} unique conversations across all folders")
     print()
 
     # ── Preserve existing metadata ──────────────────────────────────────────
-
     print("  Reading existing metadata from database(s)...")
-    for db_path in DB_PATHS:
+    for db_path in active_db_paths:
         app_name = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(db_path))))
         print(f"    {app_name}: {db_path}")
-    existing_titles, existing_inner_blobs = extract_existing_metadata_from_paths(DB_PATHS)
+    existing_titles, existing_inner_blobs = extract_existing_metadata_from_paths(active_db_paths)
     ws_count = sum(1 for v in existing_inner_blobs.values()
                    if extract_workspace_hint(v))
     print(f"  Found {len(existing_titles)} existing titles to preserve")
@@ -1620,7 +1785,6 @@ def main():
     print()
 
     # ── Scan conversations ──────────────────────────────────────────────────
-
     print("  Scanning conversations (newest first):")
     print("  " + "-" * 58)
 
@@ -1647,7 +1811,6 @@ def main():
     print()
 
     # ── Workspace assignment ───────────────────────────────────────────────
-
     unmapped = [(i, cid, title)
                 for i, (cid, title, _, inner_data, has_ws) in enumerate(resolved, 1)
                 if not has_ws]
@@ -1665,10 +1828,19 @@ def main():
     if unmapped:
         print(f"  {len(unmapped)} conversation(s) have no workspace assigned.")
         print()
-        print("  Press Enter or 1: Auto-assign workspaces (recommended)")
-        print("  Press 2:          Auto-assign + manually assign the rest")
-        print()
-        choice = input("  Your choice: ").strip()
+
+        auto_mode = getattr(opts, "auto", False)
+        if auto_mode:
+            choice = "1"
+            print("  Auto-assigning workspaces from brain artifacts (--auto/--yes enabled)...")
+        else:
+            print("  Press Enter or 1: Auto-assign workspaces (recommended)")
+            print("  Press 2:          Auto-assign + manually assign the rest")
+            print()
+            try:
+                choice = input("  Your choice: ").strip()
+            except (EOFError, OSError):
+                choice = "1"
 
         # Auto-infer from brain artifacts (both options do this)
         print()
@@ -1700,7 +1872,6 @@ def main():
                 print()
 
     # ── Build the new index ─────────────────────────────────────────────────
-
     print("  Building final index...")
     result_bytes = b""
     ws_total = 0
@@ -1735,13 +1906,18 @@ def main():
     print(f"  Workspace: {ws_total} mapped  |  Timestamps added/refreshed: {ts_updated}")
     print()
 
-    # ── Write the rebuilt index to ALL databases ────────────────────────────
+    # ── Write the rebuilt index to ALL databases (or dry run) ───────────────
+    if getattr(opts, "dry_run", False):
+        print("  [DRY RUN] Verification successful. Rebuilt payload is valid.")
+        print(f"  [DRY RUN] Would update {len(active_db_paths)} database(s) with {len(conversation_ids)} conversation(s).")
+        return 0
 
     encoded = base64.b64encode(result_bytes).decode('utf-8')
 
     print("  Writing rebuilt index to database(s):")
     saved_backups = []
-    for db_path in DB_PATHS:
+    backup_target = getattr(opts, "custom_backup_dir", None)
+    for db_path in active_db_paths:
         app_name = os.path.basename(os.path.dirname(os.path.dirname(os.path.dirname(db_path))))
         suffix = re.sub(r"[^A-Za-z0-9]+", "_", app_name).strip("_").lower()
         backup_path = write_index_to_database(db_path, encoded, suffix)
@@ -1751,7 +1927,6 @@ def main():
             print(f"      backup: {backup_path}")
 
     # ── Done ────────────────────────────────────────────────────────────────
-
     total = len(conversation_ids)
     print()
     print("  " + "=" * 58)
@@ -1760,37 +1935,48 @@ def main():
     print()
     print("  NEXT STEPS:")
     if _IS_WSL:
-        print("    1. Make sure Antigravity is fully closed on the Windows side")
+        print("    1. Make sure Antigravity is fully closed (both Windows and WSL)")
         print("    2. Open Antigravity — conversations should appear sorted by date")
-        print("    3. If changes do not appear, reboot and open Antigravity again")
+        print("    3. If changes do not appear, restart Antigravity or reboot")
     else:
         print("    1. Make sure Antigravity is fully closed")
         print("    2. Open Antigravity — conversations should appear sorted by date")
-        print("    3. If changes do not appear, reboot and open Antigravity again")
+        print("    3. If changes do not appear, restart Antigravity or reboot")
     print()
     if saved_backups:
         print("  ROLLBACK: your previous index was saved to")
-        print(f"    {_backup_dir()}")
+        print(f"    {_backup_dir(backup_target)}")
         print("  Keep those .txt files if you may want to undo this.")
         print()
     return 0
 
 
-def run_cli():
-    """Run the interactive command and always leave its result visible."""
+def run_cli(argv=None):
+    """Run the CLI command, handling arguments and exit prompt behavior."""
+    if argv is None:
+        argv = []
+
     try:
-        return main()
+        opts = parse_args(argv)
+    except SystemExit as e:
+        return e.code
+
+    try:
+        result = main(opts)
     except Exception as error:
         print()
         print("  UNEXPECTED ERROR: " + str(error))
         print("  The repair did not complete. Check any backup path shown above.")
-        return 1
-    finally:
+        result = 1
+
+    if not getattr(opts, "non_interactive", False):
         try:
             input("\n  Finished. Press Enter to close...")
         except (EOFError, OSError, KeyboardInterrupt):
             pass
 
+    return result
+
 
 if __name__ == "__main__":
-    sys.exit(run_cli())
+    sys.exit(run_cli(sys.argv[1:]))
