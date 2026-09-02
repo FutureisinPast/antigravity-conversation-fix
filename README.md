@@ -34,6 +34,8 @@ Your Antigravity conversation history disappeared? Conversations showing in the 
 | New `.db` conversation format not detected | ✅ Supports both `.pb` and `.db` files *(v1.06+)* |
 | Placeholder titles despite usable conversation text | ✅ Derives titles from the first `.db` user prompt *(v1.07+)* |
 | Recent `.db` messages disappear from the sidebar later | ✅ Refreshes updated timestamps on re-run *(v1.07+)* |
+| Dual-location WSL discovery (Windows host + Linux WSL) | ✅ Scans both environments seamlessly *(v1.07+)* |
+| Shell launcher and CLI flags (dry-run, force, auto) | ✅ Built-in `run.sh` and CLI options *(v1.07+)* |
 | Running from WSL requires manual file copying | ✅ Native WSL path detection *(v1.05+)* |
 | `python` command fails on macOS/Linux | ✅ Auto-detects Python 3, with built-in fallback *(v1.05+)* |
 
@@ -48,8 +50,8 @@ Antigravity stores conversation data in two places:
 |---|---|---|
 | Windows | `%USERPROFILE%\.gemini\antigravity\` or `antigravity-ide\` | `%APPDATA%\Antigravity IDE\...\state.vscdb` |
 | macOS | `~/.gemini/antigravity/` or `antigravity-ide/` | `~/Library/Application Support/Antigravity IDE/.../state.vscdb` |
-| Linux | `~/.gemini/antigravity/` or `antigravity-ide/` | `~/.config/Antigravity IDE/.../state.vscdb` |
-| WSL | `~/.gemini/antigravity/` or `antigravity-ide/` | Auto-resolved from Windows `%APPDATA%` via `/mnt/c/` |
+| Linux | `~/.gemini/antigravity/` or `antigravity-ide/` | `$XDG_CONFIG_HOME/Antigravity IDE/.../state.vscdb` |
+| WSL | `~/.gemini/` and Windows `/mnt/c/Users/<user>/.gemini/` | Auto-resolved from Windows `%APPDATA%` and Linux `~/.config/` |
 
 > **Note:** The tool automatically detects all folder name variants — `antigravity`, `antigravity-ide`, `antigravity-backup`, `Antigravity`, and `Antigravity IDE` — and merges conversations from all locations. Duplicates are automatically removed (newest location wins).
 
@@ -81,8 +83,11 @@ When the index gets corrupted, conversations still exist on disk but don't show 
 - **Fix:** A `.db` is preferred over a `.pb` with the same ID inside one data folder, and malformed early prompt records no longer hide a later valid prompt.
 - **Fix:** The executable now waits for Enter after every normal result or unexpected error so the final status remains visible.
 - **Fix:** **Recent-message visibility** — when an existing `.db` conversation file is newer than its indexed update time, refreshes only the sidebar's updated timestamp. Created time, workspace mapping, and unknown metadata remain unchanged.
+- **New:** **WSL dual-side discovery** — automatically scans and merges conversations from both WSL Linux (`~/.gemini/`) and the Windows host profile (`/mnt/c/Users/<user>/.gemini/`), updating databases across both environments.
+- **New:** **CLI flags & automation** — added `--dry-run` (simulate without modifying DBs), `--force` (bypass running process check), `--auto` / `--yes` (non-interactive auto-assign), and `--non-interactive` (skip exit prompt).
+- **New:** **Linux / WSL launchers** — added executable `run.sh` script and `Makefile`.
 - **Safety:** The tool now exits without scanning or writing when Antigravity is running, preventing the app from later overwriting the repaired index.
-- **Tests:** Generated SQLite/protobuf fixtures cover title extraction, malformed input, title priority, timestamp refresh, metadata preservation, and the active-process abort.
+- **Tests:** Generated SQLite/protobuf fixtures cover title extraction, malformed input, title priority, timestamp refresh, metadata preservation, Linux/WSL path handling, CLI flags, and active-process abort.
 
 ### v1.06
 - **New:** **Multi-folder conversation merge** — scans `antigravity-ide`, `antigravity`, and `antigravity-backup` folders, merges all conversations with deduplication (newest folder wins). Users who upgraded from v1.x to v2.x no longer lose conversations that were only in the old or backup folder.
@@ -128,7 +133,9 @@ If you prefer running the Python script directly, or if you are on **Mac** or **
 # Windows
 python rebuild_conversations.py
 
-# macOS / Linux
+# macOS / Linux / WSL
+./run.sh
+# or
 python3 rebuild_conversations.py
 ```
 
@@ -138,17 +145,28 @@ python3 rebuild_conversations.py
 
 Requires Python 3.7+ with no external packages. The script automatically detects your operating system and finds the correct folders (both old and new naming conventions).
 
+### CLI Flags & Options
+
+The script also supports optional CLI arguments for automation and troubleshooting:
+
+- `-n`, `--dry-run`: Preview resolved conversations and metadata without modifying databases.
+- `-f`, `--force`: Proceed even if Antigravity is detected running (e.g. within an integrated terminal).
+- `-y`, `--yes`, `--auto`: Automatically assign detected workspaces without interactive prompts.
+- `--non-interactive`: Skip the final Enter key prompt (ideal for headless scripts and CI).
+
 ### WSL Users
 
 The script natively supports WSL — just run it directly from your WSL terminal:
 
 ```bash
+./run.sh
+# or
 python3 rebuild_conversations.py
 ```
 
 The tool automatically detects WSL, resolves your Windows `%APPDATA%` path, and accesses the Antigravity database on the Windows side. No manual file copying needed.
 
-> **How it works:** The script calls `cmd.exe /c echo %APPDATA%` and converts the result with `wslpath`. If that fails, it scans `/mnt/c/Users/` for folders that have Antigravity installed. Conversations and brain data are read from your Linux home directory (`~/.gemini/antigravity/`).
+> **How it works:** The script calls `cmd.exe /c echo %APPDATA%` and converts the result with `wslpath`. Conversations and brain data are scanned and merged from both your Linux home directory (`~/.gemini/`) and your Windows profile (`/mnt/c/Users/<user>/.gemini/`). Repaired indexes are written to all active databases across both environments.
 
 ## Safety
 

@@ -366,5 +366,150 @@ class CliWrapperTests(unittest.TestCase):
         prompt.assert_not_called()
 
 
+class LinuxAndWslPathTests(unittest.TestCase):
+    def test_uri_to_local_path_linux_and_wsl(self):
+        # Linux standard file URI
+        with mock.patch.object(fix, "_SYSTEM", "Linux"), mock.patch.object(fix, "_IS_WSL", False):
+            self.assertEqual(
+                fix._uri_to_local_path("file:///home/user/projects/app"),
+                "/home/user/projects/app"
+            )
+            # URL encoded space
+            self.assertEqual(
+                fix._uri_to_local_path("file:///home/user/my%20projects/app"),
+                "/home/user/my projects/app"
+            )
+
+        # WSL file URI conversion
+        with mock.patch.object(fix, "_SYSTEM", "Linux"), mock.patch.object(fix, "_IS_WSL", True):
+            self.assertEqual(
+                fix._uri_to_local_path("file:///C:/Users/name/project"),
+                "/mnt/c/Users/name/project"
+            )
+            self.assertEqual(
+                fix._uri_to_local_path("file:///d:/Repos/My%20App"),
+                "/mnt/d/Repos/My App"
+            )
+
+    def test_path_to_workspace_uri_linux_and_wsl(self):
+        # Remote URIs pass through untouched
+        self.assertEqual(
+            fix.path_to_workspace_uri("vscode-remote://wsl+Ubuntu/home/user/app"),
+            "vscode-remote://wsl+Ubuntu/home/user/app"
+        )
+        self.assertEqual(
+            fix.path_to_workspace_uri("file:///home/user/app"),
+            "file:///home/user/app"
+        )
+
+        # Linux local path
+        with mock.patch.object(fix, "_SYSTEM", "Linux"), mock.patch.object(fix, "_IS_WSL", False):
+            self.assertEqual(
+                fix.path_to_workspace_uri("/home/user/projects/myapp"),
+                "file:///home/user/projects/myapp"
+            )
+
+        # WSL Windows mount path
+        with mock.patch.object(fix, "_SYSTEM", "Linux"), mock.patch.object(fix, "_IS_WSL", True):
+            self.assertEqual(
+                fix.path_to_workspace_uri("/mnt/c/Users/name/project"),
+                "file:///c:/Users/name/project"
+            )
+
+    def test_load_known_workspace_uris_multiple_storage_dirs(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ws_dir1 = os.path.join(temp_dir, "ws1")
+            ws_dir2 = os.path.join(temp_dir, "ws2")
+            sub1 = os.path.join(ws_dir1, "item1")
+            sub2 = os.path.join(ws_dir2, "item2")
+            os.makedirs(sub1)
+            os.makedirs(sub2)
+
+            import json
+            with open(os.path.join(sub1, "workspace.json"), "w", encoding="utf-8") as f:
+                json.dump({"folder": "file:///home/user/project1"}, f)
+
+            with open(os.path.join(sub2, "workspace.json"), "w", encoding="utf-8") as f:
+                json.dump({"workspace": "vscode-remote://wsl+Ubuntu/home/user/project2"}, f)
+
+            uris = fix.load_known_workspace_uris([ws_dir1, ws_dir2])
+            self.assertIn("file:///home/user/project1", uris)
+            self.assertIn("vscode-remote://wsl+Ubuntu/home/user/project2", uris)
+
+    def test_backup_dir_custom_and_fallback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            custom = os.path.join(temp_dir, "my_backups")
+            res = fix._backup_dir(custom)
+            self.assertEqual(res, custom)
+            self.assertTrue(os.path.isdir(custom))
+
+
+class CliArgumentTests(unittest.TestCase):
+    def test_parse_args_all_flags(self):
+        opts = fix.parse_args([
+            "-f", "-n", "-y", "--non-interactive", "--no-update-check",
+            "--db", "/custom/state.vscdb",
+            "--conv-dir", "/custom/conv",
+            "--brain-dir", "/custom/brain",
+            "--backup-dir", "/custom/backups",
+        ])
+        self.assertTrue(opts.force)
+        self.assertTrue(opts.dry_run)
+        self.assertTrue(opts.auto)
+        self.assertTrue(opts.non_interactive)
+        self.assertTrue(opts.no_update_check)
+        self.assertEqual(opts.custom_dbs, ["/custom/state.vscdb"])
+        self.assertEqual(opts.custom_conv_dirs, ["/custom/conv"])
+        self.assertEqual(opts.custom_brain_dirs, ["/custom/brain"])
+        self.assertEqual(opts.custom_backup_dir, "/custom/backups")
+
+    def test_main_force_flag_bypasses_active_process_check(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conv_dir = os.path.join(temp_dir, "conversations")
+            os.makedirs(conv_dir)
+            db_file = os.path.join(conv_dir, "test1234.db")
+            make_conversation_db(db_file, [(1, 14, title_payload("Force Test"))])
+
+            opts = fix.parse_args(["--force", "--dry-run", "--auto", "--conv-dir", conv_dir, "--no-update-check"])
+
+            with mock.patch.object(fix, "is_antigravity_running", return_value=True):
+                result = fix.main(opts)
+
+            self.assertEqual(result, 0)
+
+    def test_main_dry_run_does_not_write_to_database(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conv_dir = os.path.join(temp_dir, "conversations")
+            os.makedirs(conv_dir)
+            db_file = os.path.join(conv_dir, "test5678.db")
+            make_conversation_db(db_file, [(1, 14, title_payload("Dry Run Test"))])
+
+            opts = fix.parse_args(["--dry-run", "--conv-dir", conv_dir, "--no-update-check"])
+
+            with mock.patch.object(fix, "is_antigravity_running", return_value=False), \
+                    mock.patch("builtins.input", return_value="1"), \
+                    mock.patch.object(fix, "write_index_to_database") as write:
+                result = fix.main(opts)
+
+            self.assertEqual(result, 0)
+            write.assert_not_called()
+
+    def test_main_auto_mode_skips_interactive_prompt(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            conv_dir = os.path.join(temp_dir, "conversations")
+            os.makedirs(conv_dir)
+            db_file = os.path.join(conv_dir, "test9999.db")
+            make_conversation_db(db_file, [(1, 14, title_payload("Auto Test"))])
+
+            opts = fix.parse_args(["--auto", "--dry-run", "--conv-dir", conv_dir, "--no-update-check"])
+
+            with mock.patch.object(fix, "is_antigravity_running", return_value=False), \
+                    mock.patch("builtins.input") as mock_input:
+                result = fix.main(opts)
+
+            self.assertEqual(result, 0)
+            mock_input.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
