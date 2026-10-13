@@ -138,6 +138,16 @@ python3 rebuild_conversations.py
 
 Requires Python 3.7+ with no external packages. The script automatically detects your operating system and finds the correct folders (both old and new naming conventions).
 
+### Standalone Antigravity Desktop App (Hub)
+
+If you are using the standalone **Antigravity Desktop App** (which stores its sidebar index in `~/.gemini/antigravity/agyhub_summaries_proto.pb`) rather than or in addition to the IDE:
+
+```bash
+python3 rebuild_app_conversations.py
+```
+
+This scans your conversation databases, extracts canonical backend-generated titles, maps trajectory IDs, and rebuilds the Protobuf index with full support for direct conversations and workspace assignments.
+
 ### WSL Users
 
 The script natively supports WSL — just run it directly from your WSL terminal:

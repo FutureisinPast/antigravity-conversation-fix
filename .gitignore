@@ -20,3 +20,6 @@ env/
 .idea/
 .vscode/
 *.code-workspace
+trajectorySummaries_backup*.txt
+*.bak_*
+*.pb.bak*
