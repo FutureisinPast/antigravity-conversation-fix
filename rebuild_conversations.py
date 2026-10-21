@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Antigravity Conversation Fix  (v1.07)
+Antigravity Conversation Fix  (v1.08)
 =============================
 Rebuilds the Antigravity conversation index so all your chat history
 appears correctly — sorted by date (newest first) with proper titles.
@@ -55,13 +55,14 @@ import base64
 import json
 import re
 import time
+import datetime
 import subprocess
 import platform
 import webbrowser
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import urlopen, Request
 
-_CURRENT_VERSION = "1.07"
+_CURRENT_VERSION = "1.08"
 _GITHUB_REPO = "FutureisinPast/antigravity-conversation-fix"
 _RELEASES_URL = f"https://github.com/{_GITHUB_REPO}/releases/latest"
 
@@ -608,6 +609,100 @@ def _uri_to_local_path(file_uri):
     return raw
 
 
+
+def clean_extracted_path(p):
+    """Clean an extracted filesystem path, resolving files to parent directories."""
+    if not p:
+        return None
+    p = re.split(r'[\r\n`"\'\)\]><]', p)[0].strip()
+    p = p.replace("\\\\", "\\").replace("%20", " ")
+    lower = p.lower()
+    if ".gemini" in lower or ("antigravity" in lower and "brain" in lower):
+        return None
+    if re.search(r"\.[a-zA-Z0-9]{1,8}$", p):
+        p = os.path.dirname(p)
+    if not p or len(p) <= 3 or p in ("\\", "/", "."):
+        return None
+    return p
+
+
+def get_conversation_context(conversation_id, conv_path=None, inner_data=None):
+    """
+    Extract rich diagnostic context for a conversation (ID, date, path hint, prompt).
+    Returns dict: {
+        'cid': short ID (8 chars),
+        'date': YYYY-MM-DD,
+        'path_hint': original folder path string or None,
+        'path_exists': bool,
+        'prompt_snippet': short first user prompt string or None
+    }
+    """
+    date_str = "unknown"
+    if conv_path and os.path.exists(conv_path):
+        mtime = os.path.getmtime(conv_path)
+        date_str = datetime.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d")
+    elif inner_data:
+        ts = extract_timestamp_seconds(inner_data, 3)
+        if ts:
+            date_str = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+    path_hint = None
+    prompt_snippet = None
+
+    brain_path = _find_brain_path(conversation_id)
+    if brain_path:
+        candidates = [
+            os.path.join(brain_path, ".system_generated", "logs", "overview.txt"),
+            os.path.join(brain_path, ".system_generated", "logs", "transcript.jsonl"),
+        ]
+        if os.path.exists(brain_path):
+            for name in os.listdir(brain_path):
+                if name.endswith(".md"):
+                    candidates.append(os.path.join(brain_path, name))
+
+        for filepath in candidates:
+            if not os.path.exists(filepath):
+                continue
+            try:
+                with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if not path_hint:
+                            if "Active Document:" in line:
+                                m = re.search(r"Active Document:\s*([A-Za-z]:\\[^\r\n\(]+|[A-Za-z]:/[^\r\n\(]+)", line)
+                                if m:
+                                    path_hint = clean_extracted_path(m.group(1).strip())
+                            elif '"Cwd":' in line:
+                                m = re.search(r'"Cwd":"([^"]+)"', line)
+                                if m:
+                                    path_hint = clean_extracted_path(m.group(1))
+                            elif "file:///" in line:
+                                m = re.search(r"file:///([A-Za-z]:/[^)\s\"'\\\]><]+)", line)
+                                if m:
+                                    path_hint = clean_extracted_path(m.group(1))
+                        if not prompt_snippet and '"type":"USER_INPUT"' in line:
+                            m = re.search(r'"content":"(.*?)"', line)
+                            if m:
+                                clean = re.sub(r'\\n', ' ', m.group(1))
+                                clean = re.sub(r'<[^>]+>', '', clean).strip()
+                                prompt_snippet = re.sub(r'\s+', ' ', clean)[:65]
+                        if path_hint and prompt_snippet:
+                            break
+            except Exception:
+                pass
+            if path_hint and prompt_snippet:
+                break
+
+    path_exists = os.path.isdir(path_hint) if path_hint else False
+
+    return {
+        "cid": conversation_id[:8],
+        "date": date_str,
+        "path_hint": path_hint,
+        "path_exists": path_exists,
+        "prompt_snippet": prompt_snippet,
+    }
+
+
 def infer_workspace_from_brain(conversation_id, known_ws_uris=None):
     """
     Scan brain .md files for file:/// and vscode-remote:// paths and infer
@@ -646,6 +741,32 @@ def infer_workspace_from_brain(conversation_id, known_ws_uris=None):
                     found_uris.append("file:///" + match.group(1))
             except Exception:
                 pass
+
+        if not found_uris and not found_remote:
+            log_files = [
+                os.path.join(brain_path, ".system_generated", "logs", "overview.txt"),
+                os.path.join(brain_path, ".system_generated", "logs", "transcript.jsonl"),
+            ]
+            for log_path in log_files:
+                if not os.path.exists(log_path):
+                    continue
+                try:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                        log_data = f.read(32768)
+                    for match in remote_pattern.finditer(log_data):
+                        found_remote.append(match.group(1))
+                    for match in local_pattern.finditer(log_data):
+                        found_uris.append("file:///" + match.group(1))
+                    for cwd_m in re.finditer(r'"Cwd":"([A-Za-z]:/[^"]+|[A-Za-z]:\\[^"]+)"', log_data):
+                        clean_c = cwd_m.group(1).replace("\\\\", "/").replace("\\", "/")
+                        found_uris.append(path_to_workspace_uri(clean_c))
+                    for doc_m in re.finditer(r'Active Document:\s*([A-Za-z]:/[^\r\n\(]+|[A-Za-z]:\\[^\r\n\(]+)', log_data):
+                        clean_d = os.path.dirname(doc_m.group(1).strip()).replace("\\\\", "/").replace("\\", "/")
+                        found_uris.append(path_to_workspace_uri(clean_d))
+                except Exception:
+                    pass
+                if found_uris or found_remote:
+                    break
     except Exception:
         return None
 
@@ -803,7 +924,7 @@ def _prompt_valid_folder(prompt_text):
             print(f"      (Make sure the folder exists. Try again or press Enter to skip)")
 
 
-def interactive_workspace_assignment(unmapped_entries):
+def interactive_workspace_assignment(unmapped_entries, conv_catalog=None, existing_inner_blobs=None):
     """
     Show unmapped conversations and let user assign workspace paths.
     unmapped_entries: list of (index, conversation_id, title)
@@ -824,21 +945,42 @@ def interactive_workspace_assignment(unmapped_entries):
     assignments = {}
     batch_path = None
 
-    for idx, cid, title in unmapped_entries:
+    for entry in unmapped_entries:
+        idx, cid, title = entry[0], entry[1], entry[2]
+        conv_path = conv_catalog.get(cid) if conv_catalog else None
+        inner_data = existing_inner_blobs.get(cid) if existing_inner_blobs else None
+        ctx = get_conversation_context(cid, conv_path=conv_path, inner_data=inner_data)
+
         if batch_path:
             assignments[cid] = batch_path
             print(f"    [{idx:3d}] {title[:45]}  -> {os.path.basename(batch_path)}")
             continue
 
-        print(f"  [{idx:3d}] {title[:55]}")
+        print(f"  [{idx:3d}] {title[:60]}")
+        print(f"       ID: {ctx['cid']}  |  Date: {ctx['date']}")
+        if ctx["path_hint"]:
+            st = "exists" if ctx["path_exists"] else "not found on disk"
+            print(f"       Original Path: {ctx['path_hint']} ({st})")
+        if ctx["prompt_snippet"] and not title.lower().startswith(ctx["prompt_snippet"][:20].lower()):
+            print(f"       Prompt: \"{ctx['prompt_snippet']}\"")
+
         while True:
-            raw = input("    Workspace path (Enter=skip, 'all'=batch, 'q'=stop): ").strip()
+            if ctx["path_hint"] and ctx["path_exists"]:
+                prompt_text = "    Workspace path (Enter=skip, 'y'=use original, 'all'=batch, 'q'=stop): "
+            else:
+                prompt_text = "    Workspace path (Enter=skip, 'all'=batch, 'q'=stop): "
+            raw = input(prompt_text).strip()
             if raw == "":
                 print("    Skipped.")
                 break
             if raw.lower() == "q":
                 print("    Stopped — remaining conversations left unmapped.")
                 return assignments
+            if raw.lower() in ("y", "yes") and ctx["path_hint"] and ctx["path_exists"]:
+                folder = ctx["path_hint"]
+                print(f"    + Mapped to original path: {folder}")
+                assignments[cid] = folder
+                break
             if raw.lower() == "all":
                 folder = _prompt_valid_folder("    Path for ALL remaining (Enter=cancel): ")
                 if folder is None:
@@ -859,7 +1001,7 @@ def interactive_workspace_assignment(unmapped_entries):
                 break
             else:
                 print(f"    x Path not found: {folder}")
-                print(f"      (Try again or press Enter to skip)")
+                print(f"      (Make sure the folder exists. Try again or press Enter to skip)")
 
     if assignments:
         print()
@@ -869,6 +1011,7 @@ def interactive_workspace_assignment(unmapped_entries):
 
 
 # ─── Metadata Extraction ─────────────────────────────────────────────────────
+
 
 def _is_generated_fallback_title(title, conversation_id):
     """Return True only for this tool's exact date/ID fallback formats."""
@@ -1693,7 +1836,7 @@ def main():
                               for idx, cid, title in unmapped
                               if cid not in ws_assignments]
             if still_unmapped:
-                user_assignments = interactive_workspace_assignment(still_unmapped)
+                user_assignments = interactive_workspace_assignment(still_unmapped, conv_catalog=conv_catalog, existing_inner_blobs=existing_inner_blobs)
                 ws_assignments.update(user_assignments)
             else:
                 print("  All conversations were auto-assigned — nothing left to assign manually.")

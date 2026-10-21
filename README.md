@@ -74,6 +74,13 @@ When the index gets corrupted, conversations still exist on disk but don't show 
 
 ## Changelog
 
+### v1.08
+- **New:** **Diagnostic workspace assignment UI** — during manual review, displays short conversation ID, creation date, prompt snippet, and detected original workspace path with disk existence indicator ((exists) or (not found on disk)).
+- **New:** **One-key quick accept (y)** — when a conversation's detected original workspace exists on disk, entering y instantly confirms and maps it to that directory.
+- **Improvement:** **Deeper brain log inspection** — when artifact .md plans lack file URIs, scans .system_generated/logs/overview.txt and 	ranscript.jsonl to reliably recover original project paths and active documents.
+- **Improvement:** **Robust path cleaner** — strips markdown link wrappers, trailing punctuation, and normalizes file links to their parent project directory.
+- **Tests:** Expanded test coverage for conversation context extraction, path sanitization, and interactive quick-assignment actions.
+
 ### v1.07
 - **Fix:** **Meaningful `.db` titles** — derives a concise title from the first user prompt when neither the existing index nor brain artifacts contain a title, replacing many date-and-ID placeholders.
 - **Fix:** Prompt-derived titles now use a short first sentence when available, collapse web links to their hostname, and otherwise stop at 10 words/60 characters instead of showing a long raw request. Exact raw-prompt titles written by the earlier v1.07 executable are safely migrated on the next run.

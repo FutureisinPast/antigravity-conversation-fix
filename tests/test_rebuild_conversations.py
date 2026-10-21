@@ -366,5 +366,51 @@ class CliWrapperTests(unittest.TestCase):
         prompt.assert_not_called()
 
 
+
+
+class ConversationContextAndAssignmentTests(unittest.TestCase):
+    def test_clean_extracted_path_resolves_files_and_strips_punctuation(self):
+        self.assertEqual(
+            fix.clean_extracted_path("c:/Users/User/Desktop/project/README.md`\nTotal"),
+            "c:/Users/User/Desktop/project"
+        )
+        self.assertEqual(
+            fix.clean_extracted_path("c:\\Users\\User\\Desktop\\app\\server.py"),
+            "c:\\Users\\User\\Desktop\\app"
+        )
+        self.assertIsNone(
+            fix.clean_extracted_path("c:/Users/User/.gemini/antigravity/brain/abc/artifacts")
+        )
+        self.assertIsNone(fix.clean_extracted_path("\\"))
+        self.assertIsNone(fix.clean_extracted_path("."))
+
+    def test_interactive_assignment_accepts_y_for_existing_original_path(self):
+        unmapped = [(1, "12345678-abcd-ef01-2345-6789abcdef01", "Test Conversation")]
+        fake_context = {
+            "cid": "12345678",
+            "date": "2026-05-10",
+            "path_hint": r"D:\my_cool_project",
+            "path_exists": True,
+            "prompt_snippet": "build something cool",
+        }
+        with mock.patch.object(fix, "get_conversation_context", return_value=fake_context),              mock.patch("builtins.input", return_value="y"):
+            assignments = fix.interactive_workspace_assignment(unmapped)
+
+        self.assertEqual(assignments, {"12345678-abcd-ef01-2345-6789abcdef01": r"D:\my_cool_project"})
+
+    def test_interactive_assignment_skips_on_empty_input(self):
+        unmapped = [(1, "12345678-abcd-ef01-2345-6789abcdef01", "Test Conversation")]
+        fake_context = {
+            "cid": "12345678",
+            "date": "2026-05-10",
+            "path_hint": r"D:\my_cool_project",
+            "path_exists": False,
+            "prompt_snippet": "build something cool",
+        }
+        with mock.patch.object(fix, "get_conversation_context", return_value=fake_context),              mock.patch("builtins.input", return_value=""):
+            assignments = fix.interactive_workspace_assignment(unmapped)
+
+        self.assertEqual(assignments, {})
+
 if __name__ == "__main__":
     unittest.main()
