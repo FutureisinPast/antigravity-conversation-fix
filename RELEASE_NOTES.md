@@ -1,3 +1,21 @@
+Antigravity Conversation Fix v1.08
+
+🔍 Enhanced Diagnostic Workspace Assignment
+
+During interactive workspace assignment, the tool now displays rich diagnostic context for each unmapped conversation instead of just an ambiguous title:
+• Short Conversation ID (first 8 characters) and creation date (YYYY-MM-DD)
+• Detected original workspace/project path hint with on-disk status ('(exists)' or '(not found on disk)')
+• First user prompt preview snippet to instantly recognize the topic
+• Quick accept ('y' / 'Y'): Press 'y' to immediately assign the conversation to its detected original path if it exists on disk.
+
+🧠 Deep Brain Log Inspection for Workspace Recovery
+
+When conversations lack root markdown plan files with project links, the tool now falls back to inspecting '.system_generated/logs/overview.txt' and 'transcript.jsonl'. It recovers the original workspace path ('Cwd' and active document paths) even for ad-hoc or scratch conversations.
+
+🧹 Robust Path Sanitization
+
+A dedicated path cleaner strips markdown link wrappers, brackets, and trailing punctuation, resolving individual file links back to their parent workspace folder while filtering out internal Antigravity cache paths.
+
 Antigravity Conversation Fix v1.07
 
 💬 Meaningful Titles from `.db` Conversations
